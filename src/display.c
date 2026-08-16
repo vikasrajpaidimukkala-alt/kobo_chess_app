@@ -1,5 +1,4 @@
 #include "display.h"
-#include "hwtcon_kobo.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -14,11 +13,10 @@
 #include <unistd.h>
 
 /*
- * Packed gray offscreen, then a full-screen hwtcon update.
- *
- * On Libra Colour rotate=1, the ioctl region must be the native panel
- * size (1680x1264). A portrait 1264x1680 rect is rotated again and
- * leaves two opposite jagged tears of the previous frame.
+ * Packed gray offscreen, memcpy into the framebuffer, then FBInk
+ * full-screen GC16. Do not send HWTCON_FLAG_CFA_SKIP at 32bpp: that
+ * makes the MTK driver mix in the previous working buffer as jagged
+ * tears through the back ranks.
  */
 
 static const unsigned char FONT8[96][8] = {
@@ -168,40 +166,39 @@ static void restore_nickel_fb(int fbfd, FBInkConfig *cfg)
     }
 }
 
-static unsigned char pix_gray(const Display *d, unsigned int x, unsigned int y)
-{
-    const unsigned char *src =
-        d->pix + ((size_t)y * d->stride) + ((size_t)x * 4);
-
-    return src[0];
-}
-
 static void copy_pix_to_fb(Display *d)
 {
     unsigned int yy;
 
     for (yy = 0; yy < d->height; yy++) {
         unsigned char *dst = d->fb + ((size_t)yy * d->fb_stride);
-        unsigned int y1 = (yy + 1U < d->height) ? (yy + 1U) : yy;
-        unsigned int xx;
+        const unsigned char *src = d->pix + ((size_t)yy * d->stride);
 
-        for (xx = 0; xx < d->width; xx++) {
-            unsigned int x1 = (xx + 1U < d->width) ? (xx + 1U) : xx;
-            unsigned int sum = (unsigned int)pix_gray(d, xx, yy) +
-                               (unsigned int)pix_gray(d, x1, yy) +
-                               (unsigned int)pix_gray(d, xx, y1) +
-                               (unsigned int)pix_gray(d, x1, y1);
-            unsigned char g = (unsigned char)(sum / 4U);
+        if (d->fb_y8) {
+            unsigned int xx;
 
-            if (d->fb_y8) {
-                dst[xx] = g;
-            } else {
-                unsigned char *px = dst + ((size_t)xx * 4);
+            for (xx = 0; xx < d->width; xx++) {
+                dst[xx] = src[0];
+                src += 4;
+            }
+            continue;
+        }
 
-                px[0] = g;
-                px[1] = g;
-                px[2] = g;
-                px[3] = 0xFF;
+        if (!d->fb_bgra) {
+            memcpy(dst, src, d->stride);
+            continue;
+        }
+
+        {
+            unsigned int xx;
+
+            for (xx = 0; xx < d->width; xx++) {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = src[3];
+                dst += 4;
+                src += 4;
             }
         }
     }
@@ -224,93 +221,6 @@ static void hwtcon_cmd(const char *cmd)
     close(fd);
 }
 
-static void hwtcon_wait_complete(Display *d, uint32_t marker)
-{
-    struct hwtcon_update_marker_data md;
-    int rc;
-
-    md.update_marker = marker;
-    md.collision_test = 0;
-    rc = ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_COMPLETE, &md);
-    if (rc < 0) {
-        fprintf(stderr, "WAIT_COMPLETE marker=%u: errno=%d\n", marker, errno);
-    }
-}
-
-static int hwtcon_send(Display *d, uint32_t wfm, unsigned int flags,
-                       const char *tag)
-{
-    struct fb_var_screeninfo vinfo;
-    struct fb_fix_screeninfo finfo;
-    struct hwtcon_update_data upd;
-    int rc;
-
-    memset(&vinfo, 0, sizeof(vinfo));
-    memset(&finfo, 0, sizeof(finfo));
-    fbink_get_fb_info(&vinfo, &finfo);
-
-    memset(&upd, 0, sizeof(upd));
-    upd.update_region.top = 0;
-    upd.update_region.left = 0;
-    /*
-     * rotate=1: userspace is 1264x1680 but the panel/EPDC is 1680x1264.
-     * Sending the portrait size makes the driver rotate that rect again
-     * and leave two opposite wedges of the previous frame (the jagged
-     * tears through the back ranks).
-     */
-    if (vinfo.rotate & 1U) {
-        upd.update_region.width = vinfo.yres;
-        upd.update_region.height = vinfo.xres;
-    } else {
-        upd.update_region.width = vinfo.xres;
-        upd.update_region.height = vinfo.yres;
-    }
-    upd.waveform_mode = wfm;
-    upd.update_mode = UPDATE_MODE_FULL;
-    upd.flags = flags;
-    upd.dither_mode = 0;
-
-    if (d->marker != 0U) {
-        hwtcon_wait_complete(d, d->marker);
-    }
-
-    d->marker++;
-    if (d->marker == 0U) {
-        d->marker = 1U;
-    }
-    upd.update_marker = d->marker;
-
-    fprintf(stderr,
-            "hwtcon %s SEND_UPDATE region=%ux%u fb=%ux%u rotate=%u virt=%ux%u off=%u,%u smem=%u wfm=%u flags=0x%x marker=%u\n",
-            tag,
-            upd.update_region.width, upd.update_region.height,
-            vinfo.xres, vinfo.yres, vinfo.rotate,
-            vinfo.xres_virtual, vinfo.yres_virtual,
-            vinfo.xoffset, vinfo.yoffset, finfo.smem_len,
-            upd.waveform_mode, upd.flags, upd.update_marker);
-
-    rc = ioctl(d->fbfd, HWTCON_SEND_UPDATE, &upd);
-    if (rc < 0 && (vinfo.rotate & 1U)) {
-        fprintf(stderr, "HWTCON_SEND_UPDATE %s native region failed errno=%d; retry fb size\n",
-                tag, errno);
-        upd.update_region.width = vinfo.xres;
-        upd.update_region.height = vinfo.yres;
-        rc = ioctl(d->fbfd, HWTCON_SEND_UPDATE, &upd);
-    }
-    if (rc < 0) {
-        fprintf(stderr, "HWTCON_SEND_UPDATE %s failed: errno=%d\n", tag, errno);
-        return -1;
-    }
-
-    rc = ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_SUBMISSION, &d->marker);
-    if (rc < 0) {
-        fprintf(stderr, "WAIT_SUBMISSION %s marker=%u: errno=%d\n",
-                tag, d->marker, errno);
-    }
-    hwtcon_wait_complete(d, d->marker);
-    return 0;
-}
-
 int display_init(Display *d)
 {
     size_t required;
@@ -320,6 +230,13 @@ int display_init(Display *d)
     d->fbfd = -1;
     d->cfg.is_quiet = true;
     d->cfg.ignore_alpha = true;
+    d->cfg.bg_color = BG_WHITE;
+
+    /*
+     * Libra Colour's fb is already portrait. FBInk image/coord rotation
+     * would shear an already-upright buffer.
+     */
+    (void)setenv("FBINK_NO_SW_ROTA", "1", 1);
 
     d->fbfd = fbink_open();
     if (d->fbfd < 0) {
@@ -400,38 +317,34 @@ int display_init(Display *d)
     {
         struct fb_var_screeninfo vinfo;
         struct fb_fix_screeninfo finfo;
-        uint32_t cfa_mode = HWTCON_CFA_MODE_NONE;
+        FBInkConfig cfg;
 
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v10 native-rect ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v11 fbink-gc16-noskip ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
         fprintf(stderr, "Screen: %u x %u, fb_stride %u, bpp %u pixfmt %u y8=%d bgra=%d, panel_color %d, mtk %d\n",
                 d->width, d->height, d->fb_stride, d->state.bpp,
                 d->state.pixel_format, (int)d->fb_y8, (int)d->fb_bgra,
                 (int)d->state.has_color_panel, (int)d->state.is_mtk);
-        fprintf(stderr, "Native fb: %u x %u, rotate %u, line_len %u, rgb offsets %u/%u/%u\n",
+        fprintf(stderr, "Native fb: %u x %u, rotate %u, line_len %u, rgb offsets %u/%u/%u smem %u\n",
                 vinfo.xres, vinfo.yres, vinfo.rotate, finfo.line_length,
-                vinfo.red.offset, vinfo.green.offset, vinfo.blue.offset);
+                vinfo.red.offset, vinfo.green.offset, vinfo.blue.offset,
+                finfo.smem_len);
 
         if (d->state.is_mtk) {
             hwtcon_cmd("night_mode 0");
             hwtcon_cmd("fiti_power 1");
-            rc = ioctl(d->fbfd, HWTCON_SET_CFA_MODE, &cfa_mode);
-            if (rc < 0) {
-                fprintf(stderr, "HWTCON_SET_CFA_MODE NONE: errno=%d\n", errno);
-            } else {
-                fprintf(stderr, "HWTCON_SET_CFA_MODE NONE ok\n");
-            }
-
-            copy_pix_to_fb(d);
-            (void)hwtcon_send(d, HWTCON_WAVEFORM_MODE_INIT, 0U, "init-wipe");
-            (void)hwtcon_send(d, HWTCON_WAVEFORM_MODE_GC16,
-                              d->fb_y8 ? 0U : HWTCON_FLAG_CFA_SKIP,
-                              "gc16-white");
         }
+
+        cfg = d->cfg;
+        cfg.wfm_mode = WFM_GC16;
+        cfg.is_flashing = true;
+        cfg.dithering_mode = HWD_PASSTHROUGH;
+        rc = fbink_cls(d->fbfd, &cfg, NULL, true);
+        fprintf(stderr, "fbink_cls white gc16 rc=%d\n", rc);
     }
 
     return 0;
@@ -626,6 +539,7 @@ void display_text(Display *d, int x, int y, int scale, const char *s,
 void display_refresh(Display *d, int x, int y, int w, int h,
                      WFM_MODE_INDEX_T wfm, bool flash)
 {
+    FBInkConfig cfg = d->cfg;
     int rc;
 
     (void)x;
@@ -635,27 +549,16 @@ void display_refresh(Display *d, int x, int y, int w, int h,
 
     copy_pix_to_fb(d);
 
-    if (d->state.is_mtk) {
-        unsigned int flags = 0U;
-
-        if (!d->fb_y8) {
-            flags = HWTCON_FLAG_CFA_SKIP;
-        }
-        (void)hwtcon_send(d, HWTCON_WAVEFORM_MODE_GC16, flags, "gc16");
-        return;
-    }
-
-    {
-        FBInkConfig cfg = d->cfg;
-
-        cfg.wfm_mode = wfm;
-        cfg.is_flashing = flash;
-        cfg.dithering_mode = HWD_PASSTHROUGH;
-        rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
-        if (rc < 0) {
-            fprintf(stderr, "fbink_refresh() fullscreen failed: %d\n", rc);
-        }
-    }
+    /*
+     * Do not set CFA_SKIP at 32bpp: the MTK driver then reads the
+     * wrong working buffer and the previous frame shows through as
+     * jagged tears. FBInk's 0x0 refresh is a true full-screen update.
+     */
+    cfg.wfm_mode = wfm;
+    cfg.is_flashing = flash;
+    cfg.dithering_mode = HWD_PASSTHROUGH;
+    rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
+    fprintf(stderr, "fbink_refresh gc16 flash=%d rc=%d\n", (int)flash, rc);
 }
 
 void display_refresh_full(Display *d, bool flash)
