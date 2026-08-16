@@ -171,11 +171,11 @@ int display_init(Display *d)
     }
 
     /*
-     * Wipe leftover Nickel pixels, then flash the panel. Kaleido/MTK
-     * otherwise keeps ghost "marks" from the previous UI.
+     * Do not refresh here. A GC16 wipe on Kaleido plus a second
+     * GCC16 update collides on hwtcon and leaves jagged white/black
+     * wedges. The first ui_draw() does a single full-screen flash.
      */
     memset(d->fb, 0xFF, d->fb_size);
-    display_refresh(d, 0, 0, (int)d->width, (int)d->height, WFM_GC16, true);
 
     return 0;
 }
@@ -390,43 +390,38 @@ void display_text(Display *d, int x, int y, int scale, const char *s,
 void display_refresh(Display *d, int x, int y, int w, int h,
                      WFM_MODE_INDEX_T wfm, bool flash)
 {
-    FBInkRect rect;
     FBInkConfig cfg = d->cfg;
     int rc;
 
-    if (x < 0) {
-        w += x;
-        x = 0;
-    }
-    if (y < 0) {
-        h += y;
-        y = 0;
-    }
-    if (x + w > (int)d->width) {
-        w = (int)d->width - x;
-    }
-    if (y + h > (int)d->height) {
-        h = (int)d->height - y;
-    }
-    if (w <= 0 || h <= 0) {
-        return;
-    }
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
 
-    rect.left = (unsigned short)x;
-    rect.top = (unsigned short)y;
-    rect.width = (unsigned short)w;
-    rect.height = (unsigned short)h;
-
+    /*
+     * Always refresh the whole panel with a 0x0 region. On Libra Colour
+     * (hwtcon, native rotation 1) an explicit 1264x1680 rect is rotated
+     * again by the EPDC, so only a wedge of the screen updates. That is
+     * the jagged white/black streak.
+     */
     cfg.wfm_mode = wfm;
     cfg.is_flashing = flash;
+    if (d->color) {
+        cfg.dithering_mode = HWD_ORDERED;
+    }
 
-    rc = fbink_refresh_rect(d->fbfd, &rect, &cfg);
+    rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
     if (rc < 0) {
-        fprintf(stderr, "fbink_refresh_rect() failed: %d\n", rc);
+        fprintf(stderr, "fbink_refresh() failed: %d\n", rc);
         return;
     }
 
-    fbink_wait_for_complete(d->fbfd, LAST_MARKER);
+    if (d->state.can_wait_for_submission) {
+        fbink_wait_for_submission(d->fbfd, LAST_MARKER);
+    }
+    if (!d->state.unreliable_wait_for) {
+        fbink_wait_for_complete(d->fbfd, LAST_MARKER);
+    }
 }
 
 void display_refresh_full(Display *d, bool flash)
@@ -434,15 +429,11 @@ void display_refresh_full(Display *d, bool flash)
     WFM_MODE_INDEX_T wfm;
 
     if (d->color) {
-        /*
-         * GCC16 on Kaleido/MTK is meant to flash. Skipping the flash
-         * leaves CFA residue that looks like screen marks.
-         */
         wfm = WFM_GCC16;
         flash = true;
     } else {
         wfm = WFM_GC16;
     }
 
-    display_refresh(d, 0, 0, (int)d->width, (int)d->height, wfm, flash);
+    display_refresh(d, 0, 0, 0, 0, wfm, flash);
 }
