@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <poll.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,17 +34,14 @@ static bool g_mirror_x;
 static bool g_mirror_y;
 static unsigned int g_sw;
 static unsigned int g_sh;
+static size_t g_ev_size;
+static int g_logged;
 
 static int g_raw_x;
 static int g_raw_y;
 static int g_have_x;
 static int g_have_y;
-static int g_down;
-static int g_start_valid;
-static int g_start_x;
-static int g_start_y;
-static int g_cur_x;
-static int g_cur_y;
+static int g_armed = 1;
 static int g_tap_x = -1;
 static int g_tap_y = -1;
 
@@ -66,6 +64,16 @@ static int scale_axis(int v, int min, int max, int out_max)
     return (int)n;
 }
 
+static int needs_scale(const InDev *dev)
+{
+    int span_x = dev->abs_xmax - dev->abs_xmin;
+    int span_y = dev->abs_ymax - dev->abs_ymin;
+    int longest = (int)(g_sw > g_sh ? g_sw : g_sh);
+
+    /* Only remap ADC-style ranges (e.g. 0..4095), not panel pixels. */
+    return span_x > longest + 64 || span_y > longest + 64;
+}
+
 static void translate(int raw_x, int raw_y, int *out_x, int *out_y,
                       const InDev *dev)
 {
@@ -74,12 +82,20 @@ static void translate(int raw_x, int raw_y, int *out_x, int *out_y,
     int w = (int)g_sw - 1;
     int h = (int)g_sh - 1;
 
-    if (g_swap) {
-        x = scale_axis(raw_y, dev->abs_ymin, dev->abs_ymax, w);
-        y = scale_axis(raw_x, dev->abs_xmin, dev->abs_xmax, h);
+    if (needs_scale(dev)) {
+        if (g_swap) {
+            x = scale_axis(raw_y, dev->abs_ymin, dev->abs_ymax, w);
+            y = scale_axis(raw_x, dev->abs_xmin, dev->abs_xmax, h);
+        } else {
+            x = scale_axis(raw_x, dev->abs_xmin, dev->abs_xmax, w);
+            y = scale_axis(raw_y, dev->abs_ymin, dev->abs_ymax, h);
+        }
+    } else if (g_swap) {
+        x = raw_y;
+        y = raw_x;
     } else {
-        x = scale_axis(raw_x, dev->abs_xmin, dev->abs_xmax, w);
-        y = scale_axis(raw_y, dev->abs_ymin, dev->abs_ymax, h);
+        x = raw_x;
+        y = raw_y;
     }
 
     if (g_mirror_x) {
@@ -87,6 +103,19 @@ static void translate(int raw_x, int raw_y, int *out_x, int *out_y,
     }
     if (g_mirror_y) {
         y = h - y;
+    }
+
+    if (x < 0) {
+        x = 0;
+    }
+    if (y < 0) {
+        y = 0;
+    }
+    if (x > w) {
+        x = w;
+    }
+    if (y > h) {
+        y = h;
     }
 
     *out_x = x;
@@ -106,6 +135,24 @@ static void read_abs_range(int fd, int code, int *min, int *max)
 
     *min = 0;
     *max = 0;
+}
+
+static int already_have_path(const char *path)
+{
+    int i;
+    char link[64];
+    char resolved[64];
+
+    for (i = 0; i < g_ndevs; i++) {
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", g_devs[i].fd);
+        memset(resolved, 0, sizeof(resolved));
+        if (readlink(link, resolved, sizeof(resolved) - 1) > 0 &&
+            strcmp(resolved, path) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 static int add_fd(int fd, bool touch, bool grab)
@@ -134,26 +181,73 @@ static int add_fd(int fd, bool touch, bool grab)
         if (d->abs_ymax <= d->abs_ymin) {
             read_abs_range(fd, ABS_Y, &d->abs_ymin, &d->abs_ymax);
         }
-        if (d->abs_xmax <= d->abs_xmin) {
-            d->abs_xmin = 0;
-            d->abs_xmax = (int)g_sw - 1;
-        }
-        if (d->abs_ymax <= d->abs_ymin) {
-            d->abs_ymin = 0;
-            d->abs_ymax = (int)g_sh - 1;
-        }
+
+        fprintf(stderr, "Touch abs X=%d..%d Y=%d..%d scale=%d\n",
+                d->abs_xmin, d->abs_xmax, d->abs_ymin, d->abs_ymax,
+                needs_scale(d));
     }
 
     if (grab) {
         if (ioctl(fd, EVIOCGRAB, 1) == 0) {
             d->grab = true;
         } else {
-            fprintf(stderr, "EVIOCGRAB failed on fd %d: %s\n", fd, strerror(errno));
+            fprintf(stderr, "EVIOCGRAB failed on fd %d: %s\n",
+                    fd, strerror(errno));
         }
     }
 
     g_ndevs++;
     return 0;
+}
+
+static int evdev_has_bit(int fd, unsigned int type, unsigned int code)
+{
+    unsigned char bits[(KEY_MAX / 8) + 1];
+    unsigned int nbits = (type == 0) ? EV_MAX : KEY_MAX;
+
+    memset(bits, 0, sizeof(bits));
+    if (ioctl(fd, EVIOCGBIT(type, (nbits / 8) + 1), bits) < 0) {
+        return 0;
+    }
+
+    return bits[code / 8] & (1u << (code % 8));
+}
+
+static void scan_event_nodes(void)
+{
+    int i;
+
+    for (i = 0; i < 12; i++) {
+        char path[64];
+        int fd;
+        int is_touch;
+        int is_keys;
+
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        if (already_have_path(path)) {
+            continue;
+        }
+
+        fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+
+        is_touch = evdev_has_bit(fd, 0, EV_ABS) &&
+                   (evdev_has_bit(fd, EV_ABS, ABS_MT_POSITION_X) ||
+                    evdev_has_bit(fd, EV_ABS, ABS_X));
+        is_keys = evdev_has_bit(fd, 0, EV_KEY) && !is_touch;
+
+        if (is_touch) {
+            fprintf(stderr, "Touch node %s\n", path);
+            add_fd(fd, true, true);
+        } else if (is_keys) {
+            fprintf(stderr, "Key node %s\n", path);
+            add_fd(fd, false, false);
+        } else {
+            close(fd);
+        }
+    }
 }
 
 int input_init(const Display *d)
@@ -165,16 +259,27 @@ int input_init(const Display *d)
     INPUT_DEVICE_TYPE_T match;
 
     g_ndevs = 0;
+    g_ev_size = 0;
+    g_armed = 1;
     g_sw = d->width;
     g_sh = d->height;
-    g_swap = d->state.touch_swap_axes;
-    g_mirror_x = d->state.touch_mirror_x;
-    g_mirror_y = d->state.touch_mirror_y;
 
     /*
-     * Apply canonical rotation on top of the panel quirks, same
-     * approach as FBInk's utils/finger_trace.c.
+     * Libra Colour / Clara Colour (KOReader KoboMonza):
+     *   touch_switch_xy = true
+     *   touch_mirrored_x = false
+     *   touch_mirrored_y = true
      */
+    if (d->state.is_mtk && d->state.has_color_panel) {
+        g_swap = true;
+        g_mirror_x = false;
+        g_mirror_y = true;
+    } else {
+        g_swap = d->state.touch_swap_axes;
+        g_mirror_x = d->state.touch_mirror_x;
+        g_mirror_y = d->state.touch_mirror_y;
+    }
+
     canonical = fbink_rota_native_to_canonical(d->state.current_rota);
     switch (canonical) {
     case FB_ROTATE_CW:
@@ -194,15 +299,13 @@ int input_init(const Display *d)
     }
 
     fprintf(stderr,
-            "Touch map: swap=%d mirror_x=%d mirror_y=%d (native rota %u, canonical %u)\n",
+            "Touch map: swap=%d mirror_x=%d mirror_y=%d (native rota %u, canonical %u, mtk=%d)\n",
             (int)g_swap, (int)g_mirror_x, (int)g_mirror_y,
-            d->state.current_rota, canonical);
+            d->state.current_rota, canonical, (int)d->state.is_mtk);
 
     match = INPUT_TOUCHSCREEN | INPUT_TABLET | INPUT_PAGINATION_BUTTONS;
     devices = fbink_input_scan(match, 0U, 0U, &count);
-    if (devices == NULL) {
-        fprintf(stderr, "fbink_input_scan() failed\n");
-    } else {
+    if (devices != NULL) {
         for (i = 0; i < count; i++) {
             if (devices[i].fd < 0) {
                 continue;
@@ -216,7 +319,6 @@ int input_init(const Display *d)
             } else if (devices[i].matched &&
                        (devices[i].type & INPUT_PAGINATION_BUTTONS)) {
                 fprintf(stderr, "Buttons: %s (%s)\n", devices[i].path, devices[i].name);
-                /* Do not grab: power/cover handling stays with the kernel. */
                 add_fd(devices[i].fd, false, false);
                 devices[i].fd = -1;
             } else {
@@ -228,19 +330,7 @@ int input_init(const Display *d)
         free(devices);
     }
 
-    if (g_ndevs == 0) {
-        int fd;
-
-        fprintf(stderr, "Trying /dev/input/event1 and event0\n");
-        fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd >= 0) {
-            add_fd(fd, true, true);
-        }
-        fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd >= 0) {
-            add_fd(fd, false, false);
-        }
-    }
+    scan_event_nodes();
 
     if (g_ndevs == 0) {
         fprintf(stderr, "No input devices found\n");
@@ -269,11 +359,30 @@ void input_close(void)
     g_ndevs = 0;
 }
 
-static void handle_event(const struct input_event *ev, InDev *dev)
+static void emit_tap(int x, int y)
 {
-    if (ev->type == EV_KEY && !dev->touch) {
-        if (ev->value == 1 && ev->code != KEY_POWER) {
-            g_tap_x = -2; /* sentinel: exit key */
+    if (!g_armed) {
+        return;
+    }
+
+    g_tap_x = x;
+    g_tap_y = y;
+    g_armed = 0;
+    fprintf(stderr, "tap -> %d,%d (raw %d,%d)\n", x, y, g_raw_x, g_raw_y);
+}
+
+static void handle_core(unsigned int type, unsigned int code, int value,
+                        InDev *dev)
+{
+    if (g_logged < 24) {
+        fprintf(stderr, "ev type=%u code=%u value=%d touch=%d\n",
+                type, code, value, (int)dev->touch);
+        g_logged++;
+    }
+
+    if (type == EV_KEY && !dev->touch) {
+        if (value == 1 && code != KEY_POWER) {
+            g_tap_x = -2;
         }
         return;
     }
@@ -282,39 +391,32 @@ static void handle_event(const struct input_event *ev, InDev *dev)
         return;
     }
 
-    if (ev->type == EV_KEY) {
-        if (ev->code == BTN_TOUCH || ev->code == BTN_TOOL_FINGER) {
-            g_down = ev->value > 0;
-            if (!g_down) {
-                /* lift is finalized on SYN_REPORT */
-            } else {
-                g_start_valid = 0;
+    if (type == EV_KEY) {
+        if (code == BTN_TOUCH || code == BTN_TOOL_FINGER ||
+            code == BTN_TOOL_PEN) {
+            if (value == 0) {
+                g_armed = 1;
             }
         }
         return;
     }
 
-    if (ev->type == EV_ABS) {
-        switch (ev->code) {
+    if (type == EV_ABS) {
+        switch (code) {
         case ABS_MT_POSITION_X:
         case ABS_X:
-            g_raw_x = ev->value;
+            g_raw_x = value;
             g_have_x = 1;
             break;
         case ABS_MT_POSITION_Y:
         case ABS_Y:
-            g_raw_y = ev->value;
+            g_raw_y = value;
             g_have_y = 1;
             break;
         case ABS_MT_TRACKING_ID:
-            g_down = (ev->value >= 0);
-            if (g_down) {
-                g_start_valid = 0;
+            if (value < 0) {
+                g_armed = 1;
             }
-            break;
-        case ABS_MT_PRESSURE:
-        case ABS_PRESSURE:
-            g_down = ev->value > 0;
             break;
         default:
             break;
@@ -322,47 +424,66 @@ static void handle_event(const struct input_event *ev, InDev *dev)
         return;
     }
 
-    if (ev->type == EV_SYN && ev->code == SYN_REPORT) {
+    if (type == EV_SYN && code == SYN_REPORT) {
         int x;
         int y;
-        int dx;
-        int dy;
 
-        if (g_have_x && g_have_y) {
-            translate(g_raw_x, g_raw_y, &x, &y, dev);
-            g_cur_x = x;
-            g_cur_y = y;
-        } else {
-            x = g_cur_x;
-            y = g_cur_y;
-        }
-
-        if (g_down) {
-            if (!g_start_valid) {
-                g_start_x = x;
-                g_start_y = y;
-                g_start_valid = 1;
-            }
+        if (!g_have_x || !g_have_y) {
             return;
         }
 
-        if (!g_start_valid) {
-            return;
-        }
+        translate(g_raw_x, g_raw_y, &x, &y, dev);
+        emit_tap(x, y);
+    }
+}
 
-        dx = x - g_start_x;
-        dy = y - g_start_y;
-        if (dx < 0) {
-            dx = -dx;
-        }
-        if (dy < 0) {
-            dy = -dy;
-        }
-        if (dx < 48 && dy < 48) {
-            g_tap_x = g_start_x;
-            g_tap_y = g_start_y;
-        }
-        g_start_valid = 0;
+static size_t detect_ev_size(const unsigned char *buf, ssize_t got)
+{
+    if (got <= 0) {
+        return sizeof(struct input_event);
+    }
+
+    /* MTK kernels often use 64-bit timestamps (24-byte events). */
+    if (got % 24 == 0 && (got % 16 != 0 || got == 24 || got == 48)) {
+        return 24;
+    }
+    if (got % (ssize_t)sizeof(struct input_event) == 0) {
+        return sizeof(struct input_event);
+    }
+    if (got % 24 == 0) {
+        return 24;
+    }
+
+    return sizeof(struct input_event);
+}
+
+static void parse_buffer(const unsigned char *buf, ssize_t got, InDev *dev)
+{
+    size_t off;
+    size_t ev_size;
+
+    if (g_ev_size == 0) {
+        g_ev_size = detect_ev_size(buf, got);
+        fprintf(stderr, "input_event size %zu (read %zd)\n", g_ev_size, got);
+    }
+
+    ev_size = g_ev_size;
+    if (ev_size < 16) {
+        ev_size = 16;
+    }
+
+    for (off = 0; off + ev_size <= (size_t)got; off += ev_size) {
+        const unsigned char *p = buf + off;
+        uint16_t type16;
+        uint16_t code16;
+        int32_t value;
+        size_t base = (ev_size >= 24) ? 16 : 8;
+
+        memcpy(&type16, p + base, sizeof(type16));
+        memcpy(&code16, p + base + 2, sizeof(code16));
+        memcpy(&value, p + base + 4, sizeof(value));
+
+        handle_core(type16, code16, value, dev);
     }
 }
 
@@ -394,11 +515,13 @@ int input_poll(InputEvent *ev, int timeout_ms)
         return -1;
     }
     if (rc == 0) {
+        /* Missed lift events on MTK: re-arm after idle. */
+        g_armed = 1;
         return 0;
     }
 
     for (i = 0; i < g_ndevs; i++) {
-        struct input_event buf[32];
+        unsigned char buf[512];
         ssize_t got;
 
         if (!(pfds[i].revents & POLLIN)) {
@@ -410,14 +533,7 @@ int input_poll(InputEvent *ev, int timeout_ms)
             continue;
         }
 
-        {
-            int n_ev = (int)(got / (ssize_t)sizeof(struct input_event));
-            int e;
-
-            for (e = 0; e < n_ev; e++) {
-                handle_event(&buf[e], &g_devs[i]);
-            }
-        }
+        parse_buffer(buf, got, &g_devs[i]);
     }
 
     if (g_tap_x == -2) {

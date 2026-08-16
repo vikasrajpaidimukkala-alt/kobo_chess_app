@@ -170,6 +170,13 @@ int display_init(Display *d)
         return -1;
     }
 
+    /*
+     * Wipe leftover Nickel pixels, then flash the panel. Kaleido/MTK
+     * otherwise keeps ghost "marks" from the previous UI.
+     */
+    memset(d->fb, 0xFF, d->fb_size);
+    display_refresh(d, 0, 0, (int)d->width, (int)d->height, WFM_GC16, true);
+
     return 0;
 }
 
@@ -416,12 +423,26 @@ void display_refresh(Display *d, int x, int y, int w, int h,
     rc = fbink_refresh_rect(d->fbfd, &rect, &cfg);
     if (rc < 0) {
         fprintf(stderr, "fbink_refresh_rect() failed: %d\n", rc);
+        return;
     }
+
+    fbink_wait_for_complete(d->fbfd, LAST_MARKER);
 }
 
 void display_refresh_full(Display *d, bool flash)
 {
-    WFM_MODE_INDEX_T wfm = d->color ? WFM_GCC16 : WFM_GC16;
+    WFM_MODE_INDEX_T wfm;
+
+    if (d->color) {
+        /*
+         * GCC16 on Kaleido/MTK is meant to flash. Skipping the flash
+         * leaves CFA residue that looks like screen marks.
+         */
+        wfm = WFM_GCC16;
+        flash = true;
+    } else {
+        wfm = WFM_GC16;
+    }
 
     display_refresh(d, 0, 0, (int)d->width, (int)d->height, wfm, flash);
 }
