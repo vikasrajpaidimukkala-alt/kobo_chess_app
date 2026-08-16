@@ -1,0 +1,7 @@
+# NickelMenu entry for Kobo Chess
+# Install as: /mnt/onboard/.adds/nm/kobochess
+#
+# cmd_spawn returns immediately so Nickel can be stopped by the script.
+# quiet: hides the PID toast.
+
+menu_item :main :Chess :cmd_spawn :quiet :exec /bin/sh /mnt/onboard/.adds/kobochess/kobochess.sh

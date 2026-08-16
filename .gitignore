@@ -1,0 +1,10 @@
+*.o
+*.a
+host_test
+build/host_test
+dist/
+third_party/FBInk/Release/
+third_party/FBInk/Debug/
+third_party/FBInk/*.built
+third_party/FBInk/libi2c-staged/
+third_party/FBInk/libunibreak-staged/
