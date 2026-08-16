@@ -1,6 +1,6 @@
-# Draw into a packed RGBA bitmap, then blit with fbink_print_raw_data.
-# Direct mmap + hwtcon refresh leaves Kaleido CFA streaks on Libra Colour.
-# IMAGE=1 is required so that blit is compiled into libfbink.a.
+# Draw into a packed RGBA bitmap, copy into the native framebuffer, then
+# full-screen refresh (0x0 region). Do not use fbink_print_raw_data on
+# Libra Colour: it software-rotates an already-portrait buffer.
 #
 # Built with NickelTC (arm-nickel-linux-gnueabihf). See `make help`.
 

@@ -13,9 +13,12 @@ typedef struct {
     FBInkState state;
     unsigned char *pix;
     size_t pix_len;
+    unsigned char *fb;
+    size_t fb_size;
     unsigned int width;
     unsigned int height;
     unsigned int stride;
+    unsigned int fb_stride;
     bool color;
 } Display;
 

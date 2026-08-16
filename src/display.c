@@ -6,10 +6,12 @@
 #include <string.h>
 
 /*
- * Draw into a packed RGBA bitmap, then hand it to FBInk's image blit
- * (fbink_print_raw_data). Direct mmap writes plus a raw hwtcon refresh
- * leave jagged Kaleido CFA streaks on Libra Colour. The blit path applies
- * rotation and CFA conversion the same way KOReader does.
+ * Draw into a packed RGBA bitmap, copy it into the framebuffer in native
+ * layout, then refresh with an empty 0x0 region.
+ *
+ * Libra Colour's fb is already 1264x1680 RGBA (pixfmt 33) at rotate=1.
+ * fbink_print_raw_data still software-rotates that image, so a wedge of
+ * the panel never gets new pixels — the jagged white/black streaks.
  */
 
 static const unsigned char FONT8[96][8] = {
@@ -113,6 +115,7 @@ static const unsigned char FONT8[96][8] = {
 
 int display_init(Display *d)
 {
+    size_t required;
     int rc;
 
     memset(d, 0, sizeof(*d));
@@ -139,7 +142,16 @@ int display_init(Display *d)
     d->width = d->state.screen_width;
     d->height = d->state.screen_height;
     d->stride = d->width * 4U;
+    d->fb_stride = d->state.scanline_stride;
     d->color = d->state.has_color_panel;
+
+    if (d->state.bpp != 32) {
+        fprintf(stderr, "Need a 32-bit framebuffer (got %u bpp)\n", d->state.bpp);
+        fbink_close(d->fbfd);
+        d->fbfd = -1;
+        return -1;
+    }
+
     d->pix_len = (size_t)d->stride * d->height;
     d->pix = malloc(d->pix_len);
     if (d->pix == NULL) {
@@ -151,12 +163,32 @@ int display_init(Display *d)
 
     memset(d->pix, 0xFF, d->pix_len);
 
+    d->fb = fbink_get_fb_pointer(d->fbfd, &d->fb_size);
+    if (d->fb == NULL) {
+        fprintf(stderr, "fbink_get_fb_pointer() failed\n");
+        free(d->pix);
+        d->pix = NULL;
+        fbink_close(d->fbfd);
+        d->fbfd = -1;
+        return -1;
+    }
+
+    required = (size_t)d->fb_stride * d->height;
+    if (d->fb_size < required) {
+        fprintf(stderr, "Framebuffer too small: %zu < %zu\n", d->fb_size, required);
+        free(d->pix);
+        d->pix = NULL;
+        fbink_close(d->fbfd);
+        d->fbfd = -1;
+        return -1;
+    }
+
+    fprintf(stderr, "======== KOBOCHESS_DRAW v4 mmap+fullscreen ========\n");
     fprintf(stderr, "Device: %s (%s)\n",
             d->state.device_name, d->state.device_codename);
-    fprintf(stderr, "Screen: %u x %u, color %d, mtk %d, pixfmt %u\n",
-            d->width, d->height, (int)d->color, (int)d->state.is_mtk,
-            d->state.pixel_format);
-    fprintf(stderr, "Draw path: packed RGBA blit via fbink_print_raw_data\n");
+    fprintf(stderr, "Screen: %u x %u, fb_stride %u, pixfmt %u, color %d, mtk %d, rota %u\n",
+            d->width, d->height, d->fb_stride, d->state.pixel_format,
+            (int)d->color, (int)d->state.is_mtk, d->state.current_rota);
 
     return 0;
 }
@@ -165,6 +197,7 @@ void display_close(Display *d)
 {
     free(d->pix);
     d->pix = NULL;
+    d->fb = NULL;
 
     if (d->fbfd >= 0) {
         fbink_close(d->fbfd);
@@ -349,6 +382,7 @@ void display_refresh(Display *d, int x, int y, int w, int h,
                      WFM_MODE_INDEX_T wfm, bool flash)
 {
     FBInkConfig cfg = d->cfg;
+    unsigned int yy;
     int rc;
 
     (void)x;
@@ -356,23 +390,27 @@ void display_refresh(Display *d, int x, int y, int w, int h,
     (void)w;
     (void)h;
 
+    /*
+     * Copy packed RGBA into the native framebuffer (no software rotation),
+     * then refresh with an empty 0x0 region so hwtcon does not rotate a
+     * 1264x1680 rectangle and leave jagged wedges.
+     */
+    for (yy = 0; yy < d->height; yy++) {
+        memcpy(d->fb + ((size_t)yy * d->fb_stride),
+               d->pix + ((size_t)yy * d->stride),
+               d->stride);
+    }
+
     cfg.wfm_mode = wfm;
     cfg.is_flashing = flash;
-    cfg.ignore_alpha = true;
     cfg.dithering_mode = HWD_PASSTHROUGH;
+    if (d->color) {
+        cfg.cfa_mode = CFA_G2;
+    }
 
-    rc = fbink_print_raw_data(
-        d->fbfd,
-        d->pix,
-        (int)d->width,
-        (int)d->height,
-        d->pix_len,
-        0,
-        0,
-        &cfg
-    );
+    rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
     if (rc < 0) {
-        fprintf(stderr, "fbink_print_raw_data() failed: %d\n", rc);
+        fprintf(stderr, "fbink_refresh() fullscreen failed: %d\n", rc);
         return;
     }
 

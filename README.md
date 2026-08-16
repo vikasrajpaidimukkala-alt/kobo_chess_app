@@ -1,6 +1,6 @@
 # Kobo Chess
 
-Two-player chess for the Kobo Libra Colour. The board is drawn into an offscreen RGBA bitmap, then handed to FBInk's image blit (`fbink_print_raw_data`) so Kaleido's color filter is applied. Direct framebuffer writes skip that conversion and leave jagged white/black streaks.
+Two-player chess for the Kobo Libra Colour. The board is drawn into an offscreen RGBA bitmap, copied into the native framebuffer, then refreshed with a full-screen MediaTek update. FBInk's image blit is not used: on Libra Colour it software-rotates a buffer that is already portrait and leaves jagged streaks.
 
 ## Build on Fedora (NickelTC)
 

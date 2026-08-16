@@ -81,7 +81,7 @@ if [ "${VIA_NICKEL}" = "1" ]; then
     rm -f /tmp/nickel-hardware-status
 fi
 
-log "Starting kobochess"
+log "Starting kobochess $(ls -l "${APPDIR}/kobochess" 2>/dev/null | awk '{print $5, $6, $7, $8}')"
 "${APPDIR}/kobochess" >>"${LOG}" 2>&1
 rc=$?
 log "kobochess exited ${rc}"
