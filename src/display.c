@@ -1,22 +1,25 @@
 #include "display.h"
 #include "hwtcon_kobo.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/fb.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 /*
- * Draw into a packed RGBA bitmap, copy it into the native framebuffer,
- * then send HWTCON_SEND_UPDATE ourselves.
+ * Packed RGBA offscreen, copy into the native framebuffer, then
+ * HWTCON_SEND_UPDATE with GCC16 + CFA_G2.
  *
- * fbink_refresh() on Libra Colour does not put Kaleido CFA_G2 on the
- * ioctl. GCC16 without that flag makes hwtcon pick the wrong working
- * buffer, which shows up as jagged white/black wedges over the board.
+ * Libra Colour's MDP defaults to whatever Nickel last set. KOReader
+ * forces ABGR32 via mdp_src_format before painting; without that, CFA
+ * treats our bytes as the wrong layout and leaves jagged wedges.
  */
 
 static const unsigned char FONT8[96][8] = {
@@ -118,6 +121,78 @@ static const unsigned char FONT8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}
 };
 
+static void kobo_mtk_set_mdp_format(const char *fmt)
+{
+    DIR *dir;
+    struct dirent *ent;
+
+    dir = opendir("/sys/devices/platform");
+    if (dir == NULL) {
+        fprintf(stderr, "opendir platform: errno=%d\n", errno);
+        return;
+    }
+
+    while ((ent = readdir(dir)) != NULL) {
+        char path[256];
+        int fd;
+        size_t n;
+
+        if (strstr(ent->d_name, "hwtcon") == NULL) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path),
+                 "/sys/devices/platform/%s/mdp_src_format", ent->d_name);
+        fd = open(path, O_WRONLY | O_CLOEXEC);
+        if (fd < 0) {
+            fprintf(stderr, "open %s: errno=%d\n", path, errno);
+            continue;
+        }
+
+        n = strlen(fmt);
+        if (write(fd, fmt, n) < 0) {
+            fprintf(stderr, "write %s: errno=%d\n", path, errno);
+        } else {
+            fprintf(stderr, "mdp_src_format %s <- %s\n", path, fmt);
+        }
+        close(fd);
+    }
+
+    closedir(dir);
+}
+
+static void copy_pix_to_fb(Display *d)
+{
+    unsigned int yy;
+
+    for (yy = 0; yy < d->height; yy++) {
+        unsigned char *dst = d->fb + ((size_t)yy * d->fb_stride);
+        const unsigned char *src = d->pix + ((size_t)yy * d->stride);
+
+        if (!d->fb_bgra) {
+            memcpy(dst, src, d->stride);
+            continue;
+        }
+
+        {
+            unsigned int xx;
+
+            for (xx = 0; xx < d->width; xx++) {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = src[3];
+                dst += 4;
+                src += 4;
+            }
+        }
+    }
+
+    if (msync(d->fb, d->fb_size, MS_SYNC) < 0) {
+        fprintf(stderr, "msync: errno=%d\n", errno);
+    }
+}
+
 int display_init(Display *d)
 {
     size_t required;
@@ -142,6 +217,12 @@ int display_init(Display *d)
         return -1;
     }
 
+    kobo_mtk_set_mdp_format("ABGR32");
+    rc = fbink_reinit(d->fbfd, &d->cfg);
+    if (rc < 0) {
+        fprintf(stderr, "fbink_reinit() after mdp_src_format: %d\n", rc);
+    }
+
     fbink_get_state(&d->cfg, &d->state);
 
     d->width = d->state.screen_width;
@@ -149,6 +230,8 @@ int display_init(Display *d)
     d->stride = d->width * 4U;
     d->fb_stride = d->state.scanline_stride;
     d->color = d->state.has_color_panel;
+    d->fb_bgra = (d->state.pixel_format == FBINK_PXFMT_BGRA ||
+                  d->state.pixel_format == FBINK_PXFMT_BGR32);
 
     if (d->state.bpp != 32) {
         fprintf(stderr, "Need a 32-bit framebuffer (got %u bpp)\n", d->state.bpp);
@@ -197,14 +280,15 @@ int display_init(Display *d)
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v5 hwtcon+cfa-g2 ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v6 mdp-abgr32+cfa-g2 ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
-        fprintf(stderr, "Screen: %u x %u, fb_stride %u, pixfmt %u, color %d, mtk %d\n",
+        fprintf(stderr, "Screen: %u x %u, fb_stride %u, pixfmt %u bgra=%d, color %d, mtk %d\n",
                 d->width, d->height, d->fb_stride, d->state.pixel_format,
-                (int)d->color, (int)d->state.is_mtk);
-        fprintf(stderr, "Native fb: %u x %u, rotate %u, line_len %u\n",
-                vinfo.xres, vinfo.yres, vinfo.rotate, finfo.line_length);
+                (int)d->fb_bgra, (int)d->color, (int)d->state.is_mtk);
+        fprintf(stderr, "Native fb: %u x %u, rotate %u, line_len %u, rgb offsets %u/%u/%u\n",
+                vinfo.xres, vinfo.yres, vinfo.rotate, finfo.line_length,
+                vinfo.red.offset, vinfo.green.offset, vinfo.blue.offset);
     }
 
     return 0;
@@ -398,7 +482,6 @@ void display_text(Display *d, int x, int y, int scale, const char *s,
 void display_refresh(Display *d, int x, int y, int w, int h,
                      WFM_MODE_INDEX_T wfm, bool flash)
 {
-    unsigned int yy;
     int rc;
 
     (void)x;
@@ -407,11 +490,7 @@ void display_refresh(Display *d, int x, int y, int w, int h,
     (void)h;
     (void)wfm;
 
-    for (yy = 0; yy < d->height; yy++) {
-        memcpy(d->fb + ((size_t)yy * d->fb_stride),
-               d->pix + ((size_t)yy * d->stride),
-               d->stride);
-    }
+    copy_pix_to_fb(d);
 
     if (d->state.is_mtk) {
         struct fb_var_screeninfo vinfo;

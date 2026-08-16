@@ -21,6 +21,7 @@ typedef struct {
     unsigned int fb_stride;
     uint32_t marker;
     bool color;
+    bool fb_bgra;
 } Display;
 
 int display_init(Display *d);
