@@ -7,13 +7,13 @@
 #define COL_BG_G  232
 #define COL_BG_B  232
 
-#define COL_LIGHT_R 240
-#define COL_LIGHT_G 240
-#define COL_LIGHT_B 240
+#define COL_LIGHT_R 220
+#define COL_LIGHT_G 220
+#define COL_LIGHT_B 220
 
-#define COL_DARK_R  96
-#define COL_DARK_G  96
-#define COL_DARK_B  96
+#define COL_DARK_R  140
+#define COL_DARK_G  140
+#define COL_DARK_B  140
 
 #define COL_SEL_R   168
 #define COL_SEL_G   168
@@ -106,12 +106,15 @@ void ui_layout(Ui *ui)
     if (sq < 48) {
         sq = 48;
     }
+    sq &= ~3;
 
     ui->square = sq;
     board_w = 8 * sq;
     ui->board = make_rect(((int)d->width - board_w - gutter) / 2 + gutter,
                           status_h + margin,
                           board_w, board_w);
+    ui->board.x &= ~3;
+    ui->board.y &= ~3;
 
     btn_y = (int)d->height - margin - btn_h;
     btn_w = ((int)d->width - 2 * margin - 3 * gap) / 4;

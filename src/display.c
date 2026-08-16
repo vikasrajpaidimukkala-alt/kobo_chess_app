@@ -14,16 +14,13 @@
 #include <unistd.h>
 
 /*
- * Packed gray offscreen, copy into the framebuffer, then a single
- * full-screen GC16 update. Kaleido's GCC16+CFA colour-filter pass is
- * what left jagged wedges through the back ranks; chess does not need
- * colour, so we skip that path entirely.
+ * Packed gray offscreen, 2x2-average into the framebuffer, then a
+ * full-screen GC16 update.
  *
- * Prefer Y8 (KOReader's B&W Kaleido mode). If the driver keeps 32bpp,
- * still paint gray and send GC16 with CFA_SKIP.
- *
- * WAIT_FOR_UPDATE_COMPLETE must use the kernel's 8-byte ioctl size or
- * the wait is a no-op and updates collide.
+ * Kaleido's colour filter is a physical layer. Grayscale does not
+ * remove it. Chessboards and piece outlines beat against that mosaic
+ * and show up as jagged wedges through the back ranks. Averaging each
+ * 2x2 cell is what Nickel's "reduce rainbow" pass does.
  */
 
 static const unsigned char FONT8[96][8] = {
@@ -173,39 +170,40 @@ static void restore_nickel_fb(int fbfd, FBInkConfig *cfg)
     }
 }
 
+static unsigned char pix_gray(const Display *d, unsigned int x, unsigned int y)
+{
+    const unsigned char *src =
+        d->pix + ((size_t)y * d->stride) + ((size_t)x * 4);
+
+    return src[0];
+}
+
 static void copy_pix_to_fb(Display *d)
 {
     unsigned int yy;
 
     for (yy = 0; yy < d->height; yy++) {
         unsigned char *dst = d->fb + ((size_t)yy * d->fb_stride);
-        const unsigned char *src = d->pix + ((size_t)yy * d->stride);
+        unsigned int y1 = (yy + 1U < d->height) ? (yy + 1U) : yy;
+        unsigned int xx;
 
-        if (d->fb_y8) {
-            unsigned int xx;
+        for (xx = 0; xx < d->width; xx++) {
+            unsigned int x1 = (xx + 1U < d->width) ? (xx + 1U) : xx;
+            unsigned int sum = (unsigned int)pix_gray(d, xx, yy) +
+                               (unsigned int)pix_gray(d, x1, yy) +
+                               (unsigned int)pix_gray(d, xx, y1) +
+                               (unsigned int)pix_gray(d, x1, y1);
+            unsigned char g = (unsigned char)(sum / 4U);
 
-            for (xx = 0; xx < d->width; xx++) {
-                dst[xx] = src[0];
-                src += 4;
-            }
-            continue;
-        }
+            if (d->fb_y8) {
+                dst[xx] = g;
+            } else {
+                unsigned char *px = dst + ((size_t)xx * 4);
 
-        if (!d->fb_bgra) {
-            memcpy(dst, src, d->stride);
-            continue;
-        }
-
-        {
-            unsigned int xx;
-
-            for (xx = 0; xx < d->width; xx++) {
-                dst[0] = src[2];
-                dst[1] = src[1];
-                dst[2] = src[0];
-                dst[3] = src[3];
-                dst += 4;
-                src += 4;
+                px[0] = g;
+                px[1] = g;
+                px[2] = g;
+                px[3] = 0xFF;
             }
         }
     }
@@ -387,7 +385,7 @@ int display_init(Display *d)
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v8 gray-gc16 ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v9 gray-gc16+cfa-blur ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
         fprintf(stderr, "Screen: %u x %u, fb_stride %u, bpp %u pixfmt %u y8=%d bgra=%d, panel_color %d, mtk %d\n",
