@@ -11,8 +11,8 @@ typedef struct {
     int fbfd;
     FBInkConfig cfg;
     FBInkState state;
-    unsigned char *fb;
-    size_t fb_size;
+    unsigned char *pix;
+    size_t pix_len;
     unsigned int width;
     unsigned int height;
     unsigned int stride;

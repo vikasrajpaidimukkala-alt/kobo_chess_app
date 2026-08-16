@@ -1,6 +1,6 @@
 # Kobo Chess
 
-Two-player chess for the Kobo Libra Colour. Drawing uses the same hybrid path as `src/fb_direct_test.c`: pixels go straight into the framebuffer, FBInk is only used to open the device and issue e-ink refreshes. That avoids the lag people hit when they render a whole UI through `fbink_print`.
+Two-player chess for the Kobo Libra Colour. The board is drawn into an offscreen RGBA bitmap, then handed to FBInk's image blit (`fbink_print_raw_data`) so Kaleido's color filter is applied. Direct framebuffer writes skip that conversion and leave jagged white/black streaks.
 
 ## Build on Fedora (NickelTC)
 

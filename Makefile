@@ -1,7 +1,6 @@
-# Hybrid drawing: write pixels yourself, let FBInk handle e-ink refresh.
-# FBInk's print/cls path is what people call "laggy"; this follows
-# src/fb_direct_test.c, which already proved the pointer + refresh_rect path
-# on the Libra Colour.
+# Draw into a packed RGBA bitmap, then blit with fbink_print_raw_data.
+# Direct mmap + hwtcon refresh leaves Kaleido CFA streaks on Libra Colour.
+# IMAGE=1 is required so that blit is compiled into libfbink.a.
 #
 # Built with NickelTC (arm-nickel-linux-gnueabihf). See `make help`.
 
@@ -49,9 +48,9 @@ fbink: $(FBINK_LIB)
 $(FBINK_DIR)/fbink.h:
 	git submodule update --init --recursive
 
-$(FBINK_LIB): $(FBINK_DIR)/fbink.h
+$(FBINK_LIB): $(FBINK_DIR)/fbink.h Makefile
 	$(MAKE) -C $(FBINK_DIR) staticlib \
-		KOBO=1 MINIMAL=1 DRAW=1 BITMAP=1 INPUT=1 \
+		KOBO=1 MINIMAL=1 DRAW=1 BITMAP=1 IMAGE=1 INPUT=1 \
 		$(FBINK_CROSS)
 
 $(BUILD)/%.o: src/%.c $(FBINK_DIR)/fbink.h src/chess.h src/display.h src/input.h src/ui.h

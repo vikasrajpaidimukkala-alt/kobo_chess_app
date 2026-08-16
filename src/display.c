@@ -2,14 +2,14 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
- * Direct framebuffer pixels for drawing, FBInk only for device
- * init / rotation / e-ink refresh. That avoids FBInk's print path,
- * which is the usual source of "FBInk is laggy" reports.
- *
- * Pixel layout matches src/fb_direct_test.c (32-bit RGBA on Libra Colour).
+ * Draw into a packed RGBA bitmap, then hand it to FBInk's image blit
+ * (fbink_print_raw_data). Direct mmap writes plus a raw hwtcon refresh
+ * leave jagged Kaleido CFA streaks on Libra Colour. The blit path applies
+ * rotation and CFA conversion the same way KOReader does.
  */
 
 static const unsigned char FONT8[96][8] = {
@@ -113,12 +113,12 @@ static const unsigned char FONT8[96][8] = {
 
 int display_init(Display *d)
 {
-    size_t required;
     int rc;
 
     memset(d, 0, sizeof(*d));
     d->fbfd = -1;
     d->cfg.is_quiet = true;
+    d->cfg.ignore_alpha = true;
 
     d->fbfd = fbink_open();
     if (d->fbfd < 0) {
@@ -138,56 +138,38 @@ int display_init(Display *d)
 
     d->width = d->state.screen_width;
     d->height = d->state.screen_height;
-    d->stride = d->state.scanline_stride;
+    d->stride = d->width * 4U;
     d->color = d->state.has_color_panel;
+    d->pix_len = (size_t)d->stride * d->height;
+    d->pix = malloc(d->pix_len);
+    if (d->pix == NULL) {
+        fprintf(stderr, "Failed to allocate %zu-byte bitmap\n", d->pix_len);
+        fbink_close(d->fbfd);
+        d->fbfd = -1;
+        return -1;
+    }
+
+    memset(d->pix, 0xFF, d->pix_len);
 
     fprintf(stderr, "Device: %s (%s)\n",
             d->state.device_name, d->state.device_codename);
-    fprintf(stderr, "Screen: %u x %u, stride %u, bpp %u, fmt %u, color %d, mtk %d\n",
-            d->width, d->height, d->stride, d->state.bpp,
-            d->state.pixel_format, (int)d->color, (int)d->state.is_mtk);
-
-    if (d->state.bpp != 32) {
-        fprintf(stderr, "Need a 32-bit framebuffer (got %u bpp)\n", d->state.bpp);
-        fbink_close(d->fbfd);
-        d->fbfd = -1;
-        return -1;
-    }
-
-    d->fb = fbink_get_fb_pointer(d->fbfd, &d->fb_size);
-    if (d->fb == NULL) {
-        fprintf(stderr, "fbink_get_fb_pointer() failed\n");
-        fbink_close(d->fbfd);
-        d->fbfd = -1;
-        return -1;
-    }
-
-    required = (size_t)d->stride * d->height;
-    if (d->fb_size < required) {
-        fprintf(stderr, "Framebuffer too small: %zu < %zu\n", d->fb_size, required);
-        fbink_close(d->fbfd);
-        d->fbfd = -1;
-        return -1;
-    }
-
-    /*
-     * Do not refresh here. A GC16 wipe on Kaleido plus a second
-     * GCC16 update collides on hwtcon and leaves jagged white/black
-     * wedges. The first ui_draw() does a single full-screen flash.
-     */
-    memset(d->fb, 0xFF, d->fb_size);
+    fprintf(stderr, "Screen: %u x %u, color %d, mtk %d, pixfmt %u\n",
+            d->width, d->height, (int)d->color, (int)d->state.is_mtk,
+            d->state.pixel_format);
+    fprintf(stderr, "Draw path: packed RGBA blit via fbink_print_raw_data\n");
 
     return 0;
 }
 
 void display_close(Display *d)
 {
+    free(d->pix);
+    d->pix = NULL;
+
     if (d->fbfd >= 0) {
         fbink_close(d->fbfd);
         d->fbfd = -1;
     }
-
-    d->fb = NULL;
 }
 
 void display_put(Display *d, int x, int y, uint8_t r, uint8_t g, uint8_t b)
@@ -198,18 +180,7 @@ void display_put(Display *d, int x, int y, uint8_t r, uint8_t g, uint8_t b)
         return;
     }
 
-    pixel = d->fb + ((size_t)y * d->stride) + ((size_t)x * 4);
-
-    if (d->state.pixel_format == FBINK_PXFMT_BGRA ||
-        d->state.pixel_format == FBINK_PXFMT_BGR32) {
-        pixel[0] = b;
-        pixel[1] = g;
-        pixel[2] = r;
-        pixel[3] = 0xFF;
-        return;
-    }
-
-    /* RGBA, as on Libra Colour (see src/fb_direct_test.c). */
+    pixel = d->pix + ((size_t)y * d->stride) + ((size_t)x * 4);
     pixel[0] = r;
     pixel[1] = g;
     pixel[2] = b;
@@ -225,10 +196,6 @@ void display_fill_rect(Display *d, int x, int y, int w, int h,
     int y0 = y;
     int x1 = x + w;
     int y1 = y + h;
-    int b0 = b;
-    int g0 = g;
-    int r0 = r;
-    bool bgra;
 
     if (x0 < 0) {
         x0 = 0;
@@ -243,23 +210,14 @@ void display_fill_rect(Display *d, int x, int y, int w, int h,
         y1 = (int)d->height;
     }
 
-    bgra = (d->state.pixel_format == FBINK_PXFMT_BGRA ||
-            d->state.pixel_format == FBINK_PXFMT_BGR32);
-
     for (yy = y0; yy < y1; yy++) {
         unsigned char *pixel =
-            d->fb + ((size_t)yy * d->stride) + ((size_t)x0 * 4);
+            d->pix + ((size_t)yy * d->stride) + ((size_t)x0 * 4);
 
         for (xx = x0; xx < x1; xx++) {
-            if (bgra) {
-                pixel[0] = (unsigned char)b0;
-                pixel[1] = (unsigned char)g0;
-                pixel[2] = (unsigned char)r0;
-            } else {
-                pixel[0] = (unsigned char)r0;
-                pixel[1] = (unsigned char)g0;
-                pixel[2] = (unsigned char)b0;
-            }
+            pixel[0] = r;
+            pixel[1] = g;
+            pixel[2] = b;
             pixel[3] = 0xFF;
             pixel += 4;
         }
@@ -398,29 +356,28 @@ void display_refresh(Display *d, int x, int y, int w, int h,
     (void)w;
     (void)h;
 
-    /*
-     * Always refresh the whole panel with a 0x0 region. On Libra Colour
-     * (hwtcon, native rotation 1) an explicit 1264x1680 rect is rotated
-     * again by the EPDC, so only a wedge of the screen updates. That is
-     * the jagged white/black streak.
-     */
     cfg.wfm_mode = wfm;
     cfg.is_flashing = flash;
-    if (d->color) {
-        cfg.dithering_mode = HWD_ORDERED;
-    }
+    cfg.ignore_alpha = true;
+    cfg.dithering_mode = HWD_PASSTHROUGH;
 
-    rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
+    rc = fbink_print_raw_data(
+        d->fbfd,
+        d->pix,
+        (int)d->width,
+        (int)d->height,
+        d->pix_len,
+        0,
+        0,
+        &cfg
+    );
     if (rc < 0) {
-        fprintf(stderr, "fbink_refresh() failed: %d\n", rc);
+        fprintf(stderr, "fbink_print_raw_data() failed: %d\n", rc);
         return;
     }
 
     if (d->state.can_wait_for_submission) {
         fbink_wait_for_submission(d->fbfd, LAST_MARKER);
-    }
-    if (!d->state.unreliable_wait_for) {
-        fbink_wait_for_complete(d->fbfd, LAST_MARKER);
     }
 }
 
