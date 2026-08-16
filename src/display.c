@@ -14,12 +14,16 @@
 #include <unistd.h>
 
 /*
- * Packed RGBA offscreen, copy into the native framebuffer, then
- * HWTCON_SEND_UPDATE with GCC16 + CFA_G2.
+ * Packed gray offscreen, copy into the framebuffer, then a single
+ * full-screen GC16 update. Kaleido's GCC16+CFA colour-filter pass is
+ * what left jagged wedges through the back ranks; chess does not need
+ * colour, so we skip that path entirely.
  *
- * Libra Colour's MDP defaults to whatever Nickel last set. KOReader
- * forces ABGR32 via mdp_src_format before painting; without that, CFA
- * treats our bytes as the wrong layout and leaves jagged wedges.
+ * Prefer Y8 (KOReader's B&W Kaleido mode). If the driver keeps 32bpp,
+ * still paint gray and send GC16 with CFA_SKIP.
+ *
+ * WAIT_FOR_UPDATE_COMPLETE must use the kernel's 8-byte ioctl size or
+ * the wait is a no-op and updates collide.
  */
 
 static const unsigned char FONT8[96][8] = {
@@ -161,6 +165,14 @@ static void kobo_mtk_set_mdp_format(const char *fmt)
     closedir(dir);
 }
 
+static void restore_nickel_fb(int fbfd, FBInkConfig *cfg)
+{
+    kobo_mtk_set_mdp_format("ABGR32");
+    if (fbfd >= 0) {
+        (void)fbink_reinit(fbfd, cfg);
+    }
+}
+
 static void copy_pix_to_fb(Display *d)
 {
     unsigned int yy;
@@ -168,6 +180,16 @@ static void copy_pix_to_fb(Display *d)
     for (yy = 0; yy < d->height; yy++) {
         unsigned char *dst = d->fb + ((size_t)yy * d->fb_stride);
         const unsigned char *src = d->pix + ((size_t)yy * d->stride);
+
+        if (d->fb_y8) {
+            unsigned int xx;
+
+            for (xx = 0; xx < d->width; xx++) {
+                dst[xx] = src[0];
+                src += 4;
+            }
+            continue;
+        }
 
         if (!d->fb_bgra) {
             memcpy(dst, src, d->stride);
@@ -187,10 +209,88 @@ static void copy_pix_to_fb(Display *d)
             }
         }
     }
+}
 
-    if (msync(d->fb, d->fb_size, MS_SYNC) < 0) {
-        fprintf(stderr, "msync: errno=%d\n", errno);
+static void hwtcon_cmd(const char *cmd)
+{
+    int fd = open("/proc/hwtcon/cmd", O_WRONLY | O_CLOEXEC);
+
+    if (fd < 0) {
+        fprintf(stderr, "open /proc/hwtcon/cmd: errno=%d\n", errno);
+        return;
     }
+
+    if (write(fd, cmd, strlen(cmd)) < 0) {
+        fprintf(stderr, "hwtcon cmd '%s': errno=%d\n", cmd, errno);
+    } else {
+        fprintf(stderr, "hwtcon cmd '%s' ok\n", cmd);
+    }
+    close(fd);
+}
+
+static void hwtcon_wait_complete(Display *d, uint32_t marker)
+{
+    struct hwtcon_update_marker_data md;
+    int rc;
+
+    md.update_marker = marker;
+    md.collision_test = 0;
+    rc = ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_COMPLETE, &md);
+    if (rc < 0) {
+        fprintf(stderr, "WAIT_COMPLETE marker=%u: errno=%d\n", marker, errno);
+    }
+}
+
+static int hwtcon_send(Display *d, uint32_t wfm, unsigned int flags,
+                       const char *tag)
+{
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    struct hwtcon_update_data upd;
+    int rc;
+
+    memset(&vinfo, 0, sizeof(vinfo));
+    memset(&finfo, 0, sizeof(finfo));
+    fbink_get_fb_info(&vinfo, &finfo);
+
+    memset(&upd, 0, sizeof(upd));
+    upd.update_region.top = 0;
+    upd.update_region.left = 0;
+    upd.update_region.width = vinfo.xres;
+    upd.update_region.height = vinfo.yres;
+    upd.waveform_mode = wfm;
+    upd.update_mode = UPDATE_MODE_FULL;
+    upd.flags = flags;
+    upd.dither_mode = 0;
+
+    if (d->marker != 0U) {
+        hwtcon_wait_complete(d, d->marker);
+    }
+
+    d->marker++;
+    if (d->marker == 0U) {
+        d->marker = 1U;
+    }
+    upd.update_marker = d->marker;
+
+    fprintf(stderr,
+            "hwtcon %s SEND_UPDATE %ux%u rotate=%u wfm=%u flags=0x%x marker=%u\n",
+            tag, vinfo.xres, vinfo.yres, vinfo.rotate,
+            upd.waveform_mode, upd.flags, upd.update_marker);
+
+    rc = ioctl(d->fbfd, HWTCON_SEND_UPDATE, &upd);
+    if (rc < 0) {
+        fprintf(stderr, "HWTCON_SEND_UPDATE %s failed: errno=%d\n", tag, errno);
+        return -1;
+    }
+
+    rc = ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_SUBMISSION, &d->marker);
+    if (rc < 0) {
+        fprintf(stderr, "WAIT_SUBMISSION %s marker=%u: errno=%d\n",
+                tag, d->marker, errno);
+    }
+    hwtcon_wait_complete(d, d->marker);
+    return 0;
 }
 
 int display_init(Display *d)
@@ -217,7 +317,7 @@ int display_init(Display *d)
         return -1;
     }
 
-    kobo_mtk_set_mdp_format("ABGR32");
+    kobo_mtk_set_mdp_format("Y8");
     rc = fbink_reinit(d->fbfd, &d->cfg);
     if (rc < 0) {
         fprintf(stderr, "fbink_reinit() after mdp_src_format: %d\n", rc);
@@ -229,12 +329,15 @@ int display_init(Display *d)
     d->height = d->state.screen_height;
     d->stride = d->width * 4U;
     d->fb_stride = d->state.scanline_stride;
-    d->color = d->state.has_color_panel;
+    d->color = false;
+    d->fb_y8 = (d->state.bpp == 8);
     d->fb_bgra = (d->state.pixel_format == FBINK_PXFMT_BGRA ||
                   d->state.pixel_format == FBINK_PXFMT_BGR32);
 
-    if (d->state.bpp != 32) {
-        fprintf(stderr, "Need a 32-bit framebuffer (got %u bpp)\n", d->state.bpp);
+    if (d->state.bpp != 8 && d->state.bpp != 32) {
+        fprintf(stderr, "Need 8- or 32-bit framebuffer (got %u bpp)\n",
+                d->state.bpp);
+        restore_nickel_fb(d->fbfd, &d->cfg);
         fbink_close(d->fbfd);
         d->fbfd = -1;
         return -1;
@@ -244,6 +347,7 @@ int display_init(Display *d)
     d->pix = malloc(d->pix_len);
     if (d->pix == NULL) {
         fprintf(stderr, "Failed to allocate %zu-byte bitmap\n", d->pix_len);
+        restore_nickel_fb(d->fbfd, &d->cfg);
         fbink_close(d->fbfd);
         d->fbfd = -1;
         return -1;
@@ -256,6 +360,7 @@ int display_init(Display *d)
         fprintf(stderr, "fbink_get_fb_pointer() failed\n");
         free(d->pix);
         d->pix = NULL;
+        restore_nickel_fb(d->fbfd, &d->cfg);
         fbink_close(d->fbfd);
         d->fbfd = -1;
         return -1;
@@ -266,6 +371,7 @@ int display_init(Display *d)
         fprintf(stderr, "Framebuffer too small: %zu < %zu\n", d->fb_size, required);
         free(d->pix);
         d->pix = NULL;
+        restore_nickel_fb(d->fbfd, &d->cfg);
         fbink_close(d->fbfd);
         d->fbfd = -1;
         return -1;
@@ -276,19 +382,37 @@ int display_init(Display *d)
     {
         struct fb_var_screeninfo vinfo;
         struct fb_fix_screeninfo finfo;
+        uint32_t cfa_mode = HWTCON_CFA_MODE_NONE;
 
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v6 mdp-abgr32+cfa-g2 ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v8 gray-gc16 ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
-        fprintf(stderr, "Screen: %u x %u, fb_stride %u, pixfmt %u bgra=%d, color %d, mtk %d\n",
-                d->width, d->height, d->fb_stride, d->state.pixel_format,
-                (int)d->fb_bgra, (int)d->color, (int)d->state.is_mtk);
+        fprintf(stderr, "Screen: %u x %u, fb_stride %u, bpp %u pixfmt %u y8=%d bgra=%d, panel_color %d, mtk %d\n",
+                d->width, d->height, d->fb_stride, d->state.bpp,
+                d->state.pixel_format, (int)d->fb_y8, (int)d->fb_bgra,
+                (int)d->state.has_color_panel, (int)d->state.is_mtk);
         fprintf(stderr, "Native fb: %u x %u, rotate %u, line_len %u, rgb offsets %u/%u/%u\n",
                 vinfo.xres, vinfo.yres, vinfo.rotate, finfo.line_length,
                 vinfo.red.offset, vinfo.green.offset, vinfo.blue.offset);
+
+        if (d->state.is_mtk) {
+            hwtcon_cmd("night_mode 0");
+            hwtcon_cmd("fiti_power 1");
+            rc = ioctl(d->fbfd, HWTCON_SET_CFA_MODE, &cfa_mode);
+            if (rc < 0) {
+                fprintf(stderr, "HWTCON_SET_CFA_MODE NONE: errno=%d\n", errno);
+            } else {
+                fprintf(stderr, "HWTCON_SET_CFA_MODE NONE ok\n");
+            }
+
+            copy_pix_to_fb(d);
+            (void)hwtcon_send(d, HWTCON_WAVEFORM_MODE_GC16,
+                              d->fb_y8 ? 0U : HWTCON_FLAG_CFA_SKIP,
+                              "gc16-white");
+        }
     }
 
     return 0;
@@ -301,6 +425,7 @@ void display_close(Display *d)
     d->fb = NULL;
 
     if (d->fbfd >= 0) {
+        restore_nickel_fb(d->fbfd, &d->cfg);
         fbink_close(d->fbfd);
         d->fbfd = -1;
     }
@@ -488,60 +613,16 @@ void display_refresh(Display *d, int x, int y, int w, int h,
     (void)y;
     (void)w;
     (void)h;
-    (void)wfm;
 
     copy_pix_to_fb(d);
 
     if (d->state.is_mtk) {
-        struct fb_var_screeninfo vinfo;
-        struct fb_fix_screeninfo finfo;
-        struct hwtcon_update_data upd;
+        unsigned int flags = 0U;
 
-        memset(&vinfo, 0, sizeof(vinfo));
-        memset(&finfo, 0, sizeof(finfo));
-        fbink_get_fb_info(&vinfo, &finfo);
-
-        /*
-         * Kaleido GCC16 must be FULL and carry CFA_G2. Without that
-         * flag the MTK driver uses the wrong working buffer.
-         */
-        memset(&upd, 0, sizeof(upd));
-        upd.update_region.top = 0;
-        upd.update_region.left = 0;
-        upd.update_region.width = vinfo.xres;
-        upd.update_region.height = vinfo.yres;
-        upd.waveform_mode = d->color ? HWTCON_WAVEFORM_MODE_GCC16
-                                     : HWTCON_WAVEFORM_MODE_GC16;
-        upd.update_mode = UPDATE_MODE_FULL;
-        if (d->color) {
-            upd.flags = HWTCON_FLAG_CFA_EINK_G2;
+        if (!d->fb_y8) {
+            flags = HWTCON_FLAG_CFA_SKIP;
         }
-        upd.dither_mode = 0;
-        (void)flash;
-
-        if (d->marker != 0U) {
-            (void)ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_COMPLETE, &d->marker);
-        }
-
-        d->marker++;
-        if (d->marker == 0U) {
-            d->marker = 1U;
-        }
-        upd.update_marker = d->marker;
-
-        fprintf(stderr,
-                "hwtcon SEND_UPDATE %ux%u rotate=%u wfm=%u flags=0x%x marker=%u\n",
-                vinfo.xres, vinfo.yres, vinfo.rotate,
-                upd.waveform_mode, upd.flags, upd.update_marker);
-
-        rc = ioctl(d->fbfd, HWTCON_SEND_UPDATE, &upd);
-        if (rc < 0) {
-            fprintf(stderr, "HWTCON_SEND_UPDATE failed: errno=%d\n", errno);
-            return;
-        }
-
-        (void)ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_SUBMISSION, &d->marker);
-        (void)ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_COMPLETE, &d->marker);
+        (void)hwtcon_send(d, HWTCON_WAVEFORM_MODE_GC16, flags, "gc16");
         return;
     }
 
@@ -560,14 +641,5 @@ void display_refresh(Display *d, int x, int y, int w, int h,
 
 void display_refresh_full(Display *d, bool flash)
 {
-    WFM_MODE_INDEX_T wfm;
-
-    if (d->color) {
-        wfm = WFM_GCC16;
-        flash = true;
-    } else {
-        wfm = WFM_GC16;
-    }
-
-    display_refresh(d, 0, 0, 0, 0, wfm, flash);
+    display_refresh(d, 0, 0, 0, 0, WFM_GC16, flash);
 }

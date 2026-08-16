@@ -22,6 +22,7 @@ typedef struct {
     uint32_t marker;
     bool color;
     bool fb_bgra;
+    bool fb_y8;
 } Display;
 
 int display_init(Display *d);

@@ -1,6 +1,5 @@
-# Draw into a packed RGBA bitmap, copy into the native framebuffer, then
-# full-screen refresh (0x0 region). Do not use fbink_print_raw_data on
-# Libra Colour: it software-rotates an already-portrait buffer.
+# Draw grayscale into a packed bitmap, copy into the framebuffer, then
+# a full-screen GC16 refresh. Kaleido colour (GCC16+CFA) is not used.
 #
 # Built with NickelTC (arm-nickel-linux-gnueabihf). See `make help`.
 

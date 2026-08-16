@@ -4,44 +4,44 @@
 #include <string.h>
 
 #define COL_BG_R  232
-#define COL_BG_G  228
-#define COL_BG_B  216
+#define COL_BG_G  232
+#define COL_BG_B  232
 
-#define COL_LIGHT_R 244
-#define COL_LIGHT_G 228
-#define COL_LIGHT_B 200
+#define COL_LIGHT_R 240
+#define COL_LIGHT_G 240
+#define COL_LIGHT_B 240
 
-#define COL_DARK_R  90
-#define COL_DARK_G  122
-#define COL_DARK_B  74
+#define COL_DARK_R  96
+#define COL_DARK_G  96
+#define COL_DARK_B  96
 
-#define COL_SEL_R   232
-#define COL_SEL_G   192
-#define COL_SEL_B   32
+#define COL_SEL_R   168
+#define COL_SEL_G   168
+#define COL_SEL_B   168
 
-#define COL_LAST_R  196
-#define COL_LAST_G  84
-#define COL_LAST_B  64
+#define COL_LAST_R  136
+#define COL_LAST_G  136
+#define COL_LAST_B  136
 
-#define COL_LEGAL_R 48
-#define COL_LEGAL_G 96
-#define COL_LEGAL_B 176
+#define COL_LEGAL_R 40
+#define COL_LEGAL_G 40
+#define COL_LEGAL_B 40
 
-#define COL_TEXT_R  24
-#define COL_TEXT_G  24
-#define COL_TEXT_B  24
+#define COL_TEXT_R  16
+#define COL_TEXT_G  16
+#define COL_TEXT_B  16
 
 #define COL_WHITE_R 250
 #define COL_WHITE_G 250
-#define COL_WHITE_B 246
+#define COL_WHITE_B 250
 
-#define COL_BLACK_R 24
-#define COL_BLACK_G 24
-#define COL_BLACK_B 24
+#define COL_BLACK_R 16
+#define COL_BLACK_G 16
+#define COL_BLACK_B 16
 
-#define COL_EXIT_R  176
-#define COL_EXIT_G  40
-#define COL_EXIT_B  40
+#define COL_EXIT_R  16
+#define COL_EXIT_G  16
+#define COL_EXIT_B  16
 
 static int in_rect(Rect r, int x, int y)
 {
@@ -448,7 +448,7 @@ static void draw_dialog(Ui *ui, const char *title, const char *sub,
 {
     Display *d = ui->d;
 
-    fill_r(d, ui->dlg, 250, 248, 240);
+    fill_r(d, ui->dlg, 250, 250, 250);
     display_fill_rect(d, ui->dlg.x, ui->dlg.y, ui->dlg.w, 4, 16, 16, 16);
     display_fill_rect(d, ui->dlg.x, ui->dlg.y + ui->dlg.h - 4, ui->dlg.w, 4,
                       16, 16, 16);
@@ -461,7 +461,7 @@ static void draw_dialog(Ui *ui, const char *title, const char *sub,
     label_in(d, make_rect(ui->dlg.x + 20, ui->dlg.y + 130, ui->dlg.w - 40, 80),
              sub, 3, 80, 80, 80);
 
-    draw_button(d, ui->dlg_no, "Stay", 220, 220, 210, COL_TEXT_R, COL_TEXT_G,
+    draw_button(d, ui->dlg_no, "Stay", 220, 220, 220, COL_TEXT_R, COL_TEXT_G,
                 COL_TEXT_B);
     draw_button(d, ui->dlg_yes, yes_label, COL_EXIT_R, COL_EXIT_G, COL_EXIT_B,
                 255, 255, 255);

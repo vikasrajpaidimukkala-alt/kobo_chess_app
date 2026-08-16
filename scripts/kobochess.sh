@@ -81,7 +81,7 @@ if [ "${VIA_NICKEL}" = "1" ]; then
     rm -f /tmp/nickel-hardware-status
 
     # Let Nickel's last e-ink update finish so GCC16 does not collide.
-    usleep 400000 2>/dev/null || sleep 1
+    usleep 1000000 2>/dev/null || sleep 1
 fi
 
 log "Starting kobochess $(ls -l "${APPDIR}/kobochess" 2>/dev/null | awk '{print $5, $6, $7, $8}')"
