@@ -19,6 +19,7 @@ typedef struct {
     unsigned int height;
     unsigned int stride;
     unsigned int fb_stride;
+    uint32_t marker;
     bool color;
 } Display;
 

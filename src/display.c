@@ -1,17 +1,22 @@
 #include "display.h"
+#include "hwtcon_kobo.h"
 
+#include <errno.h>
+#include <linux/fb.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 /*
- * Draw into a packed RGBA bitmap, copy it into the framebuffer in native
- * layout, then refresh with an empty 0x0 region.
+ * Draw into a packed RGBA bitmap, copy it into the native framebuffer,
+ * then send HWTCON_SEND_UPDATE ourselves.
  *
- * Libra Colour's fb is already 1264x1680 RGBA (pixfmt 33) at rotate=1.
- * fbink_print_raw_data still software-rotates that image, so a wedge of
- * the panel never gets new pixels — the jagged white/black streaks.
+ * fbink_refresh() on Libra Colour does not put Kaleido CFA_G2 on the
+ * ioctl. GCC16 without that flag makes hwtcon pick the wrong working
+ * buffer, which shows up as jagged white/black wedges over the board.
  */
 
 static const unsigned char FONT8[96][8] = {
@@ -183,12 +188,24 @@ int display_init(Display *d)
         return -1;
     }
 
-    fprintf(stderr, "======== KOBOCHESS_DRAW v4 mmap+fullscreen ========\n");
-    fprintf(stderr, "Device: %s (%s)\n",
-            d->state.device_name, d->state.device_codename);
-    fprintf(stderr, "Screen: %u x %u, fb_stride %u, pixfmt %u, color %d, mtk %d, rota %u\n",
-            d->width, d->height, d->fb_stride, d->state.pixel_format,
-            (int)d->color, (int)d->state.is_mtk, d->state.current_rota);
+    d->marker = 0U;
+
+    {
+        struct fb_var_screeninfo vinfo;
+        struct fb_fix_screeninfo finfo;
+
+        memset(&vinfo, 0, sizeof(vinfo));
+        memset(&finfo, 0, sizeof(finfo));
+        fbink_get_fb_info(&vinfo, &finfo);
+        fprintf(stderr, "======== KOBOCHESS_DRAW v5 hwtcon+cfa-g2 ========\n");
+        fprintf(stderr, "Device: %s (%s)\n",
+                d->state.device_name, d->state.device_codename);
+        fprintf(stderr, "Screen: %u x %u, fb_stride %u, pixfmt %u, color %d, mtk %d\n",
+                d->width, d->height, d->fb_stride, d->state.pixel_format,
+                (int)d->color, (int)d->state.is_mtk);
+        fprintf(stderr, "Native fb: %u x %u, rotate %u, line_len %u\n",
+                vinfo.xres, vinfo.yres, vinfo.rotate, finfo.line_length);
+    }
 
     return 0;
 }
@@ -381,7 +398,6 @@ void display_text(Display *d, int x, int y, int scale, const char *s,
 void display_refresh(Display *d, int x, int y, int w, int h,
                      WFM_MODE_INDEX_T wfm, bool flash)
 {
-    FBInkConfig cfg = d->cfg;
     unsigned int yy;
     int rc;
 
@@ -389,33 +405,77 @@ void display_refresh(Display *d, int x, int y, int w, int h,
     (void)y;
     (void)w;
     (void)h;
+    (void)wfm;
 
-    /*
-     * Copy packed RGBA into the native framebuffer (no software rotation),
-     * then refresh with an empty 0x0 region so hwtcon does not rotate a
-     * 1264x1680 rectangle and leave jagged wedges.
-     */
     for (yy = 0; yy < d->height; yy++) {
         memcpy(d->fb + ((size_t)yy * d->fb_stride),
                d->pix + ((size_t)yy * d->stride),
                d->stride);
     }
 
-    cfg.wfm_mode = wfm;
-    cfg.is_flashing = flash;
-    cfg.dithering_mode = HWD_PASSTHROUGH;
-    if (d->color) {
-        cfg.cfa_mode = CFA_G2;
-    }
+    if (d->state.is_mtk) {
+        struct fb_var_screeninfo vinfo;
+        struct fb_fix_screeninfo finfo;
+        struct hwtcon_update_data upd;
 
-    rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
-    if (rc < 0) {
-        fprintf(stderr, "fbink_refresh() fullscreen failed: %d\n", rc);
+        memset(&vinfo, 0, sizeof(vinfo));
+        memset(&finfo, 0, sizeof(finfo));
+        fbink_get_fb_info(&vinfo, &finfo);
+
+        /*
+         * Kaleido GCC16 must be FULL and carry CFA_G2. Without that
+         * flag the MTK driver uses the wrong working buffer.
+         */
+        memset(&upd, 0, sizeof(upd));
+        upd.update_region.top = 0;
+        upd.update_region.left = 0;
+        upd.update_region.width = vinfo.xres;
+        upd.update_region.height = vinfo.yres;
+        upd.waveform_mode = d->color ? HWTCON_WAVEFORM_MODE_GCC16
+                                     : HWTCON_WAVEFORM_MODE_GC16;
+        upd.update_mode = UPDATE_MODE_FULL;
+        if (d->color) {
+            upd.flags = HWTCON_FLAG_CFA_EINK_G2;
+        }
+        upd.dither_mode = 0;
+        (void)flash;
+
+        if (d->marker != 0U) {
+            (void)ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_COMPLETE, &d->marker);
+        }
+
+        d->marker++;
+        if (d->marker == 0U) {
+            d->marker = 1U;
+        }
+        upd.update_marker = d->marker;
+
+        fprintf(stderr,
+                "hwtcon SEND_UPDATE %ux%u rotate=%u wfm=%u flags=0x%x marker=%u\n",
+                vinfo.xres, vinfo.yres, vinfo.rotate,
+                upd.waveform_mode, upd.flags, upd.update_marker);
+
+        rc = ioctl(d->fbfd, HWTCON_SEND_UPDATE, &upd);
+        if (rc < 0) {
+            fprintf(stderr, "HWTCON_SEND_UPDATE failed: errno=%d\n", errno);
+            return;
+        }
+
+        (void)ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_SUBMISSION, &d->marker);
+        (void)ioctl(d->fbfd, HWTCON_WAIT_FOR_UPDATE_COMPLETE, &d->marker);
         return;
     }
 
-    if (d->state.can_wait_for_submission) {
-        fbink_wait_for_submission(d->fbfd, LAST_MARKER);
+    {
+        FBInkConfig cfg = d->cfg;
+
+        cfg.wfm_mode = wfm;
+        cfg.is_flashing = flash;
+        cfg.dithering_mode = HWD_PASSTHROUGH;
+        rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
+        if (rc < 0) {
+            fprintf(stderr, "fbink_refresh() fullscreen failed: %d\n", rc);
+        }
     }
 }
 

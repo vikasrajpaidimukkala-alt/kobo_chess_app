@@ -53,7 +53,7 @@ $(FBINK_LIB): $(FBINK_DIR)/fbink.h Makefile
 		KOBO=1 MINIMAL=1 DRAW=1 BITMAP=1 IMAGE=1 INPUT=1 \
 		$(FBINK_CROSS)
 
-$(BUILD)/%.o: src/%.c $(FBINK_DIR)/fbink.h src/chess.h src/display.h src/input.h src/ui.h
+$(BUILD)/%.o: src/%.c $(FBINK_DIR)/fbink.h src/chess.h src/display.h src/input.h src/ui.h src/hwtcon_kobo.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
