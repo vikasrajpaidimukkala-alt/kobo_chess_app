@@ -14,13 +14,11 @@
 #include <unistd.h>
 
 /*
- * Packed gray offscreen, 2x2-average into the framebuffer, then a
- * full-screen GC16 update.
+ * Packed gray offscreen, then a full-screen hwtcon update.
  *
- * Kaleido's colour filter is a physical layer. Grayscale does not
- * remove it. Chessboards and piece outlines beat against that mosaic
- * and show up as jagged wedges through the back ranks. Averaging each
- * 2x2 cell is what Nickel's "reduce rainbow" pass does.
+ * On Libra Colour rotate=1, the ioctl region must be the native panel
+ * size (1680x1264). A portrait 1264x1680 rect is rotated again and
+ * leaves two opposite jagged tears of the previous frame.
  */
 
 static const unsigned char FONT8[96][8] = {
@@ -254,8 +252,19 @@ static int hwtcon_send(Display *d, uint32_t wfm, unsigned int flags,
     memset(&upd, 0, sizeof(upd));
     upd.update_region.top = 0;
     upd.update_region.left = 0;
-    upd.update_region.width = vinfo.xres;
-    upd.update_region.height = vinfo.yres;
+    /*
+     * rotate=1: userspace is 1264x1680 but the panel/EPDC is 1680x1264.
+     * Sending the portrait size makes the driver rotate that rect again
+     * and leave two opposite wedges of the previous frame (the jagged
+     * tears through the back ranks).
+     */
+    if (vinfo.rotate & 1U) {
+        upd.update_region.width = vinfo.yres;
+        upd.update_region.height = vinfo.xres;
+    } else {
+        upd.update_region.width = vinfo.xres;
+        upd.update_region.height = vinfo.yres;
+    }
     upd.waveform_mode = wfm;
     upd.update_mode = UPDATE_MODE_FULL;
     upd.flags = flags;
@@ -272,11 +281,22 @@ static int hwtcon_send(Display *d, uint32_t wfm, unsigned int flags,
     upd.update_marker = d->marker;
 
     fprintf(stderr,
-            "hwtcon %s SEND_UPDATE %ux%u rotate=%u wfm=%u flags=0x%x marker=%u\n",
-            tag, vinfo.xres, vinfo.yres, vinfo.rotate,
+            "hwtcon %s SEND_UPDATE region=%ux%u fb=%ux%u rotate=%u virt=%ux%u off=%u,%u smem=%u wfm=%u flags=0x%x marker=%u\n",
+            tag,
+            upd.update_region.width, upd.update_region.height,
+            vinfo.xres, vinfo.yres, vinfo.rotate,
+            vinfo.xres_virtual, vinfo.yres_virtual,
+            vinfo.xoffset, vinfo.yoffset, finfo.smem_len,
             upd.waveform_mode, upd.flags, upd.update_marker);
 
     rc = ioctl(d->fbfd, HWTCON_SEND_UPDATE, &upd);
+    if (rc < 0 && (vinfo.rotate & 1U)) {
+        fprintf(stderr, "HWTCON_SEND_UPDATE %s native region failed errno=%d; retry fb size\n",
+                tag, errno);
+        upd.update_region.width = vinfo.xres;
+        upd.update_region.height = vinfo.yres;
+        rc = ioctl(d->fbfd, HWTCON_SEND_UPDATE, &upd);
+    }
     if (rc < 0) {
         fprintf(stderr, "HWTCON_SEND_UPDATE %s failed: errno=%d\n", tag, errno);
         return -1;
@@ -315,7 +335,7 @@ int display_init(Display *d)
         return -1;
     }
 
-    kobo_mtk_set_mdp_format("Y8");
+    kobo_mtk_set_mdp_format("ABGR32");
     rc = fbink_reinit(d->fbfd, &d->cfg);
     if (rc < 0) {
         fprintf(stderr, "fbink_reinit() after mdp_src_format: %d\n", rc);
@@ -385,7 +405,7 @@ int display_init(Display *d)
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v9 gray-gc16+cfa-blur ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v10 native-rect ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
         fprintf(stderr, "Screen: %u x %u, fb_stride %u, bpp %u pixfmt %u y8=%d bgra=%d, panel_color %d, mtk %d\n",
@@ -407,6 +427,7 @@ int display_init(Display *d)
             }
 
             copy_pix_to_fb(d);
+            (void)hwtcon_send(d, HWTCON_WAVEFORM_MODE_INIT, 0U, "init-wipe");
             (void)hwtcon_send(d, HWTCON_WAVEFORM_MODE_GC16,
                               d->fb_y8 ? 0U : HWTCON_FLAG_CFA_SKIP,
                               "gc16-white");
