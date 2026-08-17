@@ -1,74 +1,107 @@
 # Kobo Chess
 
-Two-player chess for the Kobo Libra Colour. The board is drawn into an offscreen RGBA bitmap, copied into the native framebuffer, then refreshed with a full-screen MediaTek update. FBInk's image blit is not used: on Libra Colour it software-rotates a buffer that is already portrait and leaves jagged streaks.
+Chess for e-ink readers, with a two-player mode and a small built-in engine.
+Developed on a **Kobo Libra Colour**, which is the reference device, but the
+device-specific code is confined to one backend so other readers can be added
+without touching the game. See [docs/PORTING.md](docs/PORTING.md).
 
-## Build on Fedora (NickelTC)
+## Playing
 
-The Kobo userspace is 32-bit ARM hard-float. This project is built with [NickelTC](https://github.com/pgaskin/NickelTC) (`arm-nickel-linux-gnueabihf`), the same toolchain NickelMenu uses. Do not use Fedora’s generic `arm-linux-gnueabihf-gcc`.
+Tap a piece, then a highlighted square. The bottom bar is **EXIT**, **Undo**,
+**Reset**, **Flip** (so Black can play from their side) and an opponent button
+that cycles **2 Player → Easy → Medium → Hard**.
+
+With an opponent selected the computer takes the side away from you, meaning
+the one at the top of the board as it is currently oriented. That choice is
+pinned when you pick the level, so pressing Flip later to study the position
+will not hand your own pieces to the engine. Undo takes back two moves when you
+are playing the computer, so you get your own move back rather than handing it
+straight to the engine.
+
+Promotion asks Queen / Rook / Bishop / Knight.
+
+The engine is alpha-beta negamax with iterative deepening, a quiescence search,
+and a material plus piece-square evaluation. Each level pairs a depth with a
+time budget, and the budget always wins: on a slow reader it loses depth rather
+than making you wait.
+
+## Building for the Kobo
+
+Kobo userspace is 32-bit ARM hard-float. Build with
+[NickelTC](https://github.com/pgaskin/NickelTC) (`arm-nickel-linux-gnueabihf`),
+the toolchain NickelMenu uses. A generic `arm-linux-gnueabihf-gcc` produces
+binaries Nickel will not run.
 
 ```bash
 git submodule update --init --recursive
-```
-
-If `arm-nickel-linux-gnueabihf-gcc` is already on your `PATH` (extracted NickelTC tarball, or a shell inside the image):
-
-```bash
 make
 make package
 ```
 
-If the tools live in a directory that is not on `PATH` (NickelMenu-style):
+If the toolchain is not on `PATH`:
 
 ```bash
 make CROSS_COMPILE=/path/to/nickeltc/bin/arm-nickel-linux-gnueabihf-
-make CROSS_COMPILE=/path/to/nickeltc/bin/arm-nickel-linux-gnueabihf- package
 ```
 
-To build inside the NickelTC container with Podman or Docker:
+Or build in the container NickelMenu uses, which needs only podman or docker:
 
 ```bash
-sudo dnf install podman git make   # or docker
 ./scripts/nickeltc-make.sh
 ./scripts/nickeltc-make.sh package
 ```
 
-That wrapper uses `ghcr.io/pgaskin/nickeltc:1.0`, matching NickelMenu. Override with `NICKELTC_IMAGE=ghcr.io/pgaskin/nickeltc:1` if you want the rolling major tag.
-
-Chess rules can be tested on the Fedora box without the cross compiler:
+## Building without a device
 
 ```bash
-make host-test
+make PLATFORM=host   # frames come out as PNG
+make test            # chess rules and engine checks
 ```
 
-## Install
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-With the Kobo mounted (or over SSH/USBNet):
+## Installing
+
+With the Kobo mounted, or over SSH/USBNet:
 
 ```text
 dist/kobochess/     ->  /mnt/onboard/.adds/kobochess/
 dist/nm/kobochess   ->  /mnt/onboard/.adds/nm/kobochess
 ```
 
-Scripts must be executable. Reboot once so NickelMenu loads the new item. Start it from Nickel's main menu: **Chess**.
-
-## Playing
-
-Tap a piece, then a highlighted square. Bottom bar: **EXIT**, **Undo**, **Reset**, **Flip** (so Black can play from their side). Promotion asks Queen / Rook / Bishop / Knight.
+Scripts must stay executable. Reboot once so NickelMenu picks up the new item,
+then start it from Nickel's main menu: **Chess**.
 
 ## Leaving without bricking the device
 
-The red **EXIT** button is the normal way out. It asks for confirmation, then the launcher restarts Nickel.
+The red **EXIT** button is the normal way out. It asks for confirmation, then
+the launcher restarts Nickel. Also safe:
 
-Also safe:
+- Either page-turn button, which opens the same dialog; press again to confirm
+- `killall kobochess` over SSH
+- If Nickel cannot be restarted, the launcher reboots rather than leave you
+  with a dead screen
 
-- Either page-turn button (opens the same confirm dialog; press again to confirm)
-- SIGTERM from SSH (`killall kobochess`)
-- If Nickel cannot be restarted, the launcher **reboots** instead of leaving a dead screen
+The power button is not grabbed, so a 15-second hold still force-reboots.
 
-The power button is not grabbed, so a 15-second hold still force-reboots if something goes wrong.
-
-Do not enable Wi-Fi or Bluetooth from the chess app. Reloading those MediaTek modules on a Libra Colour is a known kernel-panic path that can drop NickelMenu.
+Do not enable Wi-Fi or Bluetooth from inside the app. Reloading those MediaTek
+modules on a Libra Colour is a known kernel-panic path that can take NickelMenu
+with it.
 
 ## Logs
 
 `/mnt/onboard/.adds/kobochess/kobochess.log`
+
+For display problems, `KOBOCHESS_DUMP=1` additionally writes the drawn canvas
+and a readback of the framebuffer, which distinguishes a drawing bug from a
+device one.
+
+## Layout
+
+```
+src/chess/      rules and search, no I/O
+src/gfx/        software rasteriser onto an RGBA canvas
+src/ui/         board, pieces, buttons, hit-testing
+src/app/        game loop
+src/platform/   kobo/ and host/ backends
+```

@@ -1,9 +1,14 @@
-*.o
-*.a
-host_test
-build/host_test
-build/engine_bench
+build/
 dist/
+*.o
+*.d
+*.a
+
+# Frames and framebuffer dumps produced while debugging
+frame-*.png
+dump_*.pgm
+*.log
+
 third_party/FBInk/Release/
 third_party/FBInk/Debug/
 third_party/FBInk/*.built

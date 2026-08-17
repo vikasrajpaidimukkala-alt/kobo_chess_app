@@ -1,8 +1,8 @@
-#include "chess.h"
-#include "display.h"
-#include "engine.h"
-#include "input.h"
-#include "ui.h"
+#include "chess/chess.h"
+#include "chess/engine.h"
+#include "gfx/canvas.h"
+#include "platform/platform.h"
+#include "ui/ui.h"
 
 #include <signal.h>
 #include <stdbool.h>
@@ -214,29 +214,40 @@ static int handle_hit(Ui *ui, UiHit hit, int sq)
     return 0;
 }
 
+static void show(const Platform *plat, Ui *ui, RefreshMode mode)
+{
+    ui_render(ui);
+    plat->present(ui->canvas, mode);
+}
+
 int main(void)
 {
-    Display display;
+    const Platform *plat = platform_get();
+    PlatformInfo info;
+    Canvas canvas;
     Game game;
     Ui ui;
-    int rc = 0;
 
     install_signals();
 
-    fprintf(stderr, "Kobo Chess starting (pid %d)\n", getpid());
+    fprintf(stderr, "Kobo Chess starting on '%s' (pid %d)\n",
+            plat->name, getpid());
 
-    if (display_init(&display) != 0) {
+    if (plat->open(&info) != 0) {
         return 1;
     }
 
-    if (input_init(&display) != 0) {
-        fprintf(stderr, "Input init failed; EXIT still works via signals.\n");
+    if (!canvas_init(&canvas, info.width, info.height)) {
+        fprintf(stderr, "Cannot allocate a %ux%u canvas\n",
+                info.width, info.height);
+        plat->close();
+        return 1;
     }
 
     chess_init(&game);
 
     memset(&ui, 0, sizeof(ui));
-    ui.d = &display;
+    ui.canvas = &canvas;
     ui.game = &game;
     ui.selected = SQ_NONE;
     ui.last_from = SQ_NONE;
@@ -246,7 +257,7 @@ int main(void)
     ui.ai_level = ENGINE_OFF;
     ui.ai_color = CHESS_BLACK;
     ui_layout(&ui);
-    ui_draw(&ui, true);
+    show(plat, &ui, REFRESH_FULL);
 
     while (!g_quit_now) {
         InputEvent ev;
@@ -258,12 +269,12 @@ int main(void)
          */
         if (ui_ai_to_move(&ui) && ui.mode == MODE_PLAY) {
             play_engine_move(&ui);
-            input_drain();
-            ui_draw(&ui, false);
+            plat->drain();
+            show(plat, &ui, REFRESH_UI);
             continue;
         }
 
-        pr = input_poll(&ev, 400);
+        pr = plat->poll(&ev, 400);
         if (pr < 0) {
             break;
         }
@@ -271,16 +282,16 @@ int main(void)
             continue;
         }
 
-        if (ev.kind == INP_EXIT_KEY) {
+        if (ev.kind == INPUT_QUIT) {
             if (ui.mode == MODE_CONFIRM_EXIT) {
                 break;
             }
             ui.mode = MODE_CONFIRM_EXIT;
-            ui_draw(&ui, false);
+            show(plat, &ui, REFRESH_UI);
             continue;
         }
 
-        if (ev.kind == INP_TAP) {
+        if (ev.kind == INPUT_TAP) {
             int sq = SQ_NONE;
             UiHit hit = ui_hit(&ui, ev.x, ev.y, &sq);
 
@@ -288,12 +299,12 @@ int main(void)
             if (handle_hit(&ui, hit, sq)) {
                 break;
             }
-            ui_draw(&ui, false);
+            show(plat, &ui, REFRESH_UI);
         }
     }
 
-    fprintf(stderr, "Exiting chess; releasing input and framebuffer\n");
-    input_close();
-    display_close(&display);
-    return rc;
+    fprintf(stderr, "Exiting chess; releasing the panel and input\n");
+    canvas_free(&canvas);
+    plat->close();
+    return 0;
 }

@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "chess.h"
-#include "engine.h"
+#include "chess/chess.h"
+#include "chess/engine.h"
 
 static void move_text(Move m, char *buf, size_t n)
 {

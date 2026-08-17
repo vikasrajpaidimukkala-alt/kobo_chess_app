@@ -2,7 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
-#include "input.h"
+#include "kobo.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -250,8 +250,9 @@ static void scan_event_nodes(void)
     }
 }
 
-int input_init(const Display *d)
+int kobo_input_open(unsigned int width, unsigned int height)
 {
+    const FBInkState *st = kobo_display_state();
     size_t count = 0;
     size_t i;
     FBInkInputDevice *devices;
@@ -261,8 +262,8 @@ int input_init(const Display *d)
     g_ndevs = 0;
     g_ev_size = 0;
     g_armed = 1;
-    g_sw = d->width;
-    g_sh = d->height;
+    g_sw = (int)width;
+    g_sh = (int)height;
 
     /*
      * Libra Colour / Clara Colour (KOReader KoboMonza):
@@ -270,17 +271,17 @@ int input_init(const Display *d)
      *   touch_mirrored_x = false
      *   touch_mirrored_y = true
      */
-    if (d->state.is_mtk && d->state.has_color_panel) {
+    if (st->is_mtk && st->has_color_panel) {
         g_swap = true;
         g_mirror_x = false;
         g_mirror_y = true;
     } else {
-        g_swap = d->state.touch_swap_axes;
-        g_mirror_x = d->state.touch_mirror_x;
-        g_mirror_y = d->state.touch_mirror_y;
+        g_swap = st->touch_swap_axes;
+        g_mirror_x = st->touch_mirror_x;
+        g_mirror_y = st->touch_mirror_y;
     }
 
-    canonical = fbink_rota_native_to_canonical(d->state.current_rota);
+    canonical = fbink_rota_native_to_canonical(st->current_rota);
     switch (canonical) {
     case FB_ROTATE_CW:
         g_swap = !g_swap;
@@ -301,7 +302,7 @@ int input_init(const Display *d)
     fprintf(stderr,
             "Touch map: swap=%d mirror_x=%d mirror_y=%d (native rota %u, canonical %u, mtk=%d)\n",
             (int)g_swap, (int)g_mirror_x, (int)g_mirror_y,
-            d->state.current_rota, canonical, (int)d->state.is_mtk);
+            st->current_rota, canonical, (int)st->is_mtk);
 
     match = INPUT_TOUCHSCREEN | INPUT_TABLET | INPUT_PAGINATION_BUTTONS;
     devices = fbink_input_scan(match, 0U, 0U, &count);
@@ -340,7 +341,7 @@ int input_init(const Display *d)
     return 0;
 }
 
-void input_close(void)
+void kobo_input_close(void)
 {
     int i;
 
@@ -437,7 +438,7 @@ static void handle_core(unsigned int type, unsigned int code, int value,
     }
 }
 
-static size_t detect_ev_size(const unsigned char *buf, ssize_t got)
+static size_t detect_ev_size(ssize_t got)
 {
     if (got <= 0) {
         return sizeof(struct input_event);
@@ -463,7 +464,7 @@ static void parse_buffer(const unsigned char *buf, ssize_t got, InDev *dev)
     size_t ev_size;
 
     if (g_ev_size == 0) {
-        g_ev_size = detect_ev_size(buf, got);
+        g_ev_size = detect_ev_size(got);
         fprintf(stderr, "input_event size %zu (read %zd)\n", g_ev_size, got);
     }
 
@@ -491,7 +492,7 @@ static void parse_buffer(const unsigned char *buf, ssize_t got, InDev *dev)
  * Throw away whatever piled up while the engine was searching, so a
  * tap aimed at the old position is not replayed against the new one.
  */
-void input_drain(void)
+void kobo_input_drain(void)
 {
     int i;
 
@@ -507,14 +508,14 @@ void input_drain(void)
     g_tap_x = -1;
 }
 
-int input_poll(InputEvent *ev, int timeout_ms)
+int kobo_input_poll(InputEvent *ev, int timeout_ms)
 {
     struct pollfd pfds[MAX_FDS];
     int i;
     int n;
     int rc;
 
-    ev->kind = INP_NONE;
+    ev->kind = INPUT_NONE;
     ev->x = 0;
     ev->y = 0;
     g_tap_x = -1;
@@ -557,11 +558,11 @@ int input_poll(InputEvent *ev, int timeout_ms)
     }
 
     if (g_tap_x == -2) {
-        ev->kind = INP_EXIT_KEY;
+        ev->kind = INPUT_QUIT;
         return 1;
     }
     if (g_tap_x >= 0) {
-        ev->kind = INP_TAP;
+        ev->kind = INPUT_TAP;
         ev->x = g_tap_x;
         ev->y = g_tap_y;
         return 1;

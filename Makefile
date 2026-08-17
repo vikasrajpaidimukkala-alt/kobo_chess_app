@@ -1,13 +1,38 @@
-# Draw grayscale into a packed bitmap, copy into the framebuffer, then
-# a full-screen GC16 refresh. Kaleido colour (GCC16+CFA) is not used.
+# Kobo Chess — chess for e-ink readers.
 #
-# Built with NickelTC (arm-nickel-linux-gnueabihf). See `make help`.
+#   make                     build for the Kobo (needs NickelTC)
+#   make PLATFORM=host       build for this machine, frames come out as PNG
+#   make test                chess rules + engine checks (no cross compiler)
+#   make package             stage dist/ for copying onto a device
+#   make help                toolchain notes
+#
+# Adding a device means adding src/platform/<name>/ and one case below.
+# See docs/PORTING.md.
 
-# Triple used inside ghcr.io/pgaskin/nickeltc and a host-extracted NickelTC.
+PLATFORM ?= kobo
+
+BUILD := build/$(PLATFORM)
+APP   := $(BUILD)/kobochess
+
+# Portable: game rules, search, rasteriser, UI, main loop. No device here.
+CORE_SRCS := \
+	src/app/main.c \
+	src/chess/chess.c \
+	src/chess/engine.c \
+	src/gfx/canvas.c \
+	src/ui/ui.c
+
+CPPFLAGS := -Isrc
+override CFLAGS += -Wall -Wextra -O2 -std=gnu11
+LDLIBS :=
+
+ifeq ($(PLATFORM),kobo)
+
+# Kobo userspace is 32-bit ARM hard-float. Build with NickelTC
+# (arm-nickel-linux-gnueabihf), the toolchain NickelMenu uses; Fedora's
+# generic arm-linux-gnueabihf-gcc produces binaries Nickel will not run.
 CROSS_TC ?= arm-nickel-linux-gnueabihf
 
-# NickelMenu-style prefix, including a path if the tools are not on PATH:
-#   make CROSS_COMPILE=/path/to/nickeltc/bin/arm-nickel-linux-gnueabihf-
 ifdef CROSS_COMPILE
 CC          := $(CROSS_COMPILE)gcc
 STRIP       := $(CROSS_COMPILE)strip
@@ -18,27 +43,43 @@ STRIP       := $(CROSS_TC)-strip
 FBINK_CROSS := CROSS_TC=$(CROSS_TC)
 endif
 
-# Flags from the NickelTC README. Thumb armv7hf matches Kobo userspace,
-# including Libra Colour (the kernel is A53; libc is still this ABI).
-NICKEL_CFLAGS := -march=armv7-a -mtune=cortex-a8 -mfpu=neon -mfloat-abi=hard -mthumb
+# Thumb armv7hf matches Kobo userspace, Libra Colour included: the SoC
+# is a Cortex-A53 but libc is still built for this ABI.
+override CFLAGS += -march=armv7-a -mtune=cortex-a8 -mfpu=neon \
+	-mfloat-abi=hard -mthumb
 
 FBINK_DIR := third_party/FBInk
 FBINK_LIB := $(FBINK_DIR)/Release/libfbink.a
 
-CPPFLAGS := -I$(FBINK_DIR) -I$(FBINK_DIR)/Release
-override CFLAGS += -Wall -Wextra -O2 -std=gnu11 $(NICKEL_CFLAGS)
-LDFLAGS  :=
-LDLIBS   := $(FBINK_LIB) -lm -ldl
+CPPFLAGS += -I$(FBINK_DIR) -I$(FBINK_DIR)/Release
+LDLIBS   += $(FBINK_LIB) -lm -ldl
 
-BUILD := build
-APP   := $(BUILD)/kobochess
+PLATFORM_SRCS := \
+	src/platform/kobo/kobo_platform.c \
+	src/platform/kobo/kobo_display.c \
+	src/platform/kobo/kobo_input.c
+PLATFORM_DEPS := $(FBINK_LIB)
 
-SRCS := src/main.c src/chess.c src/display.c src/engine.c src/input.c src/ui.c
-OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
+else ifeq ($(PLATFORM),host)
 
-.PHONY: all app tests host-test engine-bench clean distclean package help fbink
+CC    := cc
+STRIP := :
+LDLIBS += -lz
 
-all: app tests
+PLATFORM_SRCS := src/platform/host/host_platform.c
+PLATFORM_DEPS :=
+
+else
+$(error Unknown PLATFORM '$(PLATFORM)'. Try 'kobo' or 'host')
+endif
+
+SRCS := $(CORE_SRCS) $(PLATFORM_SRCS)
+OBJS := $(SRCS:%.c=$(BUILD)/%.o)
+DEPS := $(OBJS:.o=.d)
+
+.PHONY: all app test host-test engine-bench clean distclean package help fbink
+
+all: app
 
 app: $(APP)
 
@@ -52,40 +93,35 @@ $(FBINK_LIB): $(FBINK_DIR)/fbink.h Makefile
 		KOBO=1 MINIMAL=1 DRAW=1 BITMAP=1 IMAGE=1 INPUT=1 \
 		$(FBINK_CROSS)
 
-$(BUILD)/%.o: src/%.c $(FBINK_DIR)/fbink.h src/chess.h src/display.h src/engine.h src/input.h src/ui.h src/hwtcon_kobo.h
-	@mkdir -p $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+$(BUILD)/%.o: %.c $(PLATFORM_DEPS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(APP): $(OBJS) $(FBINK_LIB)
+$(APP): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 	$(STRIP) $@
 
-$(BUILD)/fbink_test: src/fbink_test.c $(FBINK_LIB)
-	@mkdir -p $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ src/fbink_test.c $(LDLIBS)
-	$(STRIP) $@
+-include $(DEPS)
 
-$(BUILD)/fb_direct_test: src/fb_direct_test.c $(FBINK_LIB)
-	@mkdir -p $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ src/fb_direct_test.c $(LDLIBS)
-	$(STRIP) $@
-
-tests: $(BUILD)/fbink_test $(BUILD)/fb_direct_test
+# Rules and engine are portable, so these always build for this machine.
+test: host-test engine-bench
 
 host-test:
-	mkdir -p $(BUILD)
-	cc -std=c11 -Wall -Wextra -O2 -o $(BUILD)/host_test src/chess.c src/host_test.c
-	$(BUILD)/host_test
+	@mkdir -p build/tests
+	cc -std=gnu11 -Wall -Wextra -O2 -Isrc -o build/tests/chess_test \
+		src/chess/chess.c tests/chess_test.c
+	build/tests/chess_test
 
-# Engine sanity checks and a nodes/second probe. Cross compile the same
-# sources to time the real device: the level budgets are tuned to it.
 engine-bench:
-	mkdir -p $(BUILD)
-	cc -std=c11 -Wall -Wextra -O2 -Isrc -o $(BUILD)/engine_bench \
-		src/chess.c src/engine.c src/engine_bench.c
-	$(BUILD)/engine_bench
+	@mkdir -p build/tests
+	cc -std=gnu11 -Wall -Wextra -O2 -Isrc -o build/tests/engine_bench \
+		src/chess/chess.c src/chess/engine.c tests/engine_bench.c
+	build/tests/engine_bench
 
 package: $(APP)
+ifneq ($(PLATFORM),kobo)
+	$(error package only makes sense for PLATFORM=kobo)
+endif
 	mkdir -p dist/kobochess dist/nm
 	cp -a $(APP) scripts/kobochess.sh scripts/restart-nickel.sh dist/kobochess/
 	chmod 755 dist/kobochess/kobochess dist/kobochess/*.sh
@@ -95,33 +131,28 @@ package: $(APP)
 	@echo "Copy dist/nm/kobochess -> /mnt/onboard/.adds/nm/kobochess"
 
 clean:
-	rm -f $(OBJS) $(APP) $(BUILD)/fbink_test $(BUILD)/fb_direct_test \
-		$(BUILD)/host_test $(BUILD)/engine_bench
-	rm -rf dist
+	rm -rf build dist
 
 distclean: clean
 	if [ -f $(FBINK_DIR)/Makefile ]; then $(MAKE) -C $(FBINK_DIR) distclean; fi
 
 help:
-	@echo "Kobo Chess — NickelTC (Fedora)"
+	@echo "Kobo Chess"
 	@echo
-	@echo "Toolchain triple: $(CROSS_TC)"
-	@echo "Compiler:         $(CC)"
+	@echo "  make                    build for PLATFORM=$(PLATFORM)"
+	@echo "  make PLATFORM=host      build and run anywhere, frames as PNG"
+	@echo "  make test               chess rules + engine checks"
+	@echo "  make package            stage dist/ for the device"
 	@echo
-	@echo "1. NickelTC already on PATH (extracted tarball or image /tc):"
-	@echo "     git submodule update --init --recursive"
-	@echo "     make"
-	@echo "     make package"
+	@echo "Kobo builds need NickelTC ($(CROSS_TC)):"
 	@echo
-	@echo "2. NickelTC installed but not on PATH:"
-	@echo "     make CROSS_COMPILE=/path/to/nickeltc/bin/arm-nickel-linux-gnueabihf-"
+	@echo "  1. Toolchain on PATH:"
+	@echo "       git submodule update --init --recursive"
+	@echo "       make && make package"
 	@echo
-	@echo "3. Podman/Docker image (same invocation NickelMenu uses):"
-	@echo "     ./scripts/nickeltc-make.sh"
-	@echo "     ./scripts/nickeltc-make.sh package"
+	@echo "  2. Toolchain elsewhere:"
+	@echo "       make CROSS_COMPILE=/path/to/bin/$(CROSS_TC)-"
 	@echo
-	@echo "4. Chess-rules test on the Fedora box (no cross compiler):"
-	@echo "     make host-test"
-	@echo
-	@echo "Then copy dist/kobochess to /mnt/onboard/.adds/kobochess"
-	@echo "and dist/nm/kobochess to /mnt/onboard/.adds/nm/kobochess"
+	@echo "  3. Container (what NickelMenu uses):"
+	@echo "       ./scripts/nickeltc-make.sh"
+	@echo "       ./scripts/nickeltc-make.sh package"

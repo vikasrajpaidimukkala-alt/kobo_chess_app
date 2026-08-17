@@ -3,8 +3,8 @@
 
 #include <stdbool.h>
 
-#include "chess.h"
-#include "display.h"
+#include "chess/chess.h"
+#include "gfx/canvas.h"
 
 typedef enum {
     MODE_PLAY = 0,
@@ -37,7 +37,7 @@ typedef struct {
 } Rect;
 
 typedef struct {
-    Display *d;
+    Canvas *canvas;
     Game *game;
     UiMode mode;
     int selected;      /* SQ_NONE or 0-63 */
@@ -63,7 +63,10 @@ typedef struct {
 } Ui;
 
 void ui_layout(Ui *ui);
-void ui_draw(Ui *ui, bool full_flash);
+
+/* Draws the whole screen into ui->canvas. Presenting is the caller's job. */
+void ui_render(Ui *ui);
+
 UiHit ui_hit(const Ui *ui, int x, int y, int *square_out);
 
 /* True when the computer owns the side to move and the game is live. */
