@@ -14,10 +14,18 @@
 
 /*
  * Packed gray offscreen, memcpy into the framebuffer, then FBInk
- * full-screen GC16. Do not send HWTCON_FLAG_CFA_SKIP at 32bpp: that
- * makes the MTK driver mix in the previous working buffer as jagged
- * tears through the back ranks.
+ * full-screen GC16. Fence each EPDC update with wait_for_submission
+ * + wait_for_complete before touching the framebuffer again: writing
+ * the next frame while a waveform is still in flight produces jagged
+ * old/new bands on Kaleido 3.
+ *
+ * Do not send HWTCON_FLAG_CFA_SKIP at 32bpp: that makes the MTK
+ * driver mix in the previous working buffer as jagged tears.
  */
+
+#ifndef LAST_MARKER
+#define LAST_MARKER 0U
+#endif
 
 static const unsigned char FONT8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* space */
@@ -204,6 +212,47 @@ static void copy_pix_to_fb(Display *d)
     }
 }
 
+static void wait_epdc(Display *d, const char *tag)
+{
+    int rc;
+
+    if (d->state.can_wait_for_submission) {
+        rc = fbink_wait_for_submission(d->fbfd, LAST_MARKER);
+        fprintf(stderr, "fbink_wait_for_submission %s rc=%d\n", tag, rc);
+    }
+
+    rc = fbink_wait_for_complete(d->fbfd, LAST_MARKER);
+    fprintf(stderr, "fbink_wait_for_complete %s rc=%d\n", tag, rc);
+}
+
+static int refresh_gc16_wait(Display *d, const char *tag)
+{
+    FBInkConfig cfg = d->cfg;
+    char before[64];
+    char after[64];
+    int rc;
+
+    snprintf(before, sizeof(before), "before-%s", tag);
+    snprintf(after, sizeof(after), "after-%s", tag);
+
+    /*
+     * The EPDC is still walking the previous waveform. Do not rewrite
+     * the mmap'd framebuffer until that update has finished.
+     */
+    wait_epdc(d, before);
+
+    copy_pix_to_fb(d);
+
+    cfg.wfm_mode = WFM_GC16;
+    cfg.is_flashing = true;
+    cfg.dithering_mode = HWD_PASSTHROUGH;
+    rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
+    fprintf(stderr, "fbink_refresh %s gc16 flash=1 rc=%d\n", tag, rc);
+
+    wait_epdc(d, after);
+    return rc;
+}
+
 static void hwtcon_cmd(const char *cmd)
 {
     int fd = open("/proc/hwtcon/cmd", O_WRONLY | O_CLOEXEC);
@@ -317,12 +366,11 @@ int display_init(Display *d)
     {
         struct fb_var_screeninfo vinfo;
         struct fb_fix_screeninfo finfo;
-        FBInkConfig cfg;
 
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v11 fbink-gc16-noskip ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v12 wait-fence ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
         fprintf(stderr, "Screen: %u x %u, fb_stride %u, bpp %u pixfmt %u y8=%d bgra=%d, panel_color %d, mtk %d\n",
@@ -333,18 +381,31 @@ int display_init(Display *d)
                 vinfo.xres, vinfo.yres, vinfo.rotate, finfo.line_length,
                 vinfo.red.offset, vinfo.green.offset, vinfo.blue.offset,
                 finfo.smem_len);
+        fprintf(stderr, "can_wait_for_submission=%d unreliable_wait_for=%d\n",
+                (int)d->state.can_wait_for_submission,
+                (int)d->state.unreliable_wait_for);
 
         if (d->state.is_mtk) {
             hwtcon_cmd("night_mode 0");
             hwtcon_cmd("fiti_power 1");
         }
 
-        cfg = d->cfg;
-        cfg.wfm_mode = WFM_GC16;
-        cfg.is_flashing = true;
-        cfg.dithering_mode = HWD_PASSTHROUGH;
-        rc = fbink_cls(d->fbfd, &cfg, NULL, true);
-        fprintf(stderr, "fbink_cls white gc16 rc=%d\n", rc);
+        /*
+         * Diagnostic: white / black / white, each fenced, then the
+         * chessboard paint in main. If the board is clean after this,
+         * the jagged bands were refresh overlap, not drawing.
+         */
+        fprintf(stderr, "sync-test WHITE\n");
+        display_clear(d, 0xFF, 0xFF, 0xFF);
+        refresh_gc16_wait(d, "white1");
+
+        fprintf(stderr, "sync-test BLACK\n");
+        display_clear(d, 0x00, 0x00, 0x00);
+        refresh_gc16_wait(d, "black");
+
+        fprintf(stderr, "sync-test WHITE\n");
+        display_clear(d, 0xFF, 0xFF, 0xFF);
+        refresh_gc16_wait(d, "white2");
     }
 
     return 0;
@@ -539,29 +600,18 @@ void display_text(Display *d, int x, int y, int scale, const char *s,
 void display_refresh(Display *d, int x, int y, int w, int h,
                      WFM_MODE_INDEX_T wfm, bool flash)
 {
-    FBInkConfig cfg = d->cfg;
-    int rc;
-
     (void)x;
     (void)y;
     (void)w;
     (void)h;
+    (void)wfm;
+    (void)flash;
 
-    copy_pix_to_fb(d);
-
-    /*
-     * Do not set CFA_SKIP at 32bpp: the MTK driver then reads the
-     * wrong working buffer and the previous frame shows through as
-     * jagged tears. FBInk's 0x0 refresh is a true full-screen update.
-     */
-    cfg.wfm_mode = wfm;
-    cfg.is_flashing = flash;
-    cfg.dithering_mode = HWD_PASSTHROUGH;
-    rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
-    fprintf(stderr, "fbink_refresh gc16 flash=%d rc=%d\n", (int)flash, rc);
+    refresh_gc16_wait(d, "chess");
 }
 
 void display_refresh_full(Display *d, bool flash)
 {
-    display_refresh(d, 0, 0, 0, 0, WFM_GC16, flash);
+    (void)flash;
+    refresh_gc16_wait(d, "chess");
 }
