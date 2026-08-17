@@ -1,5 +1,6 @@
 #include "chess.h"
 #include "display.h"
+#include "engine.h"
 #include "input.h"
 #include "ui.h"
 
@@ -43,6 +44,20 @@ static void reset_ui_game(Ui *ui)
     ui->pending_to = SQ_NONE;
 }
 
+/*
+ * The computer takes the side away from the player, i.e. the one at
+ * the top of the board as it is currently oriented. It is pinned when
+ * the level is chosen so that a later Flip, which people use just to
+ * look at the position, cannot hand over their own pieces.
+ */
+static void cycle_level(Ui *ui)
+{
+    ui->ai_level = (ui->ai_level + 1) % (ENGINE_HARD + 1);
+    ui->ai_color = ui->flipped ? CHESS_WHITE : CHESS_BLACK;
+    ui->selected = SQ_NONE;
+    ui->legal = 0;
+}
+
 static bool apply_move(Ui *ui, Move m)
 {
     if (!chess_make(ui->game, m)) {
@@ -58,6 +73,24 @@ static bool apply_move(Ui *ui, Move m)
     ui->mode = MODE_PLAY;
     chess_update_result(ui->game);
     return true;
+}
+
+static void play_engine_move(Ui *ui)
+{
+    EngineLimits lim;
+    EngineInfo info;
+    Move m;
+
+    engine_limits_for_level(ui->ai_level, &lim);
+    if (!engine_best_move(ui->game, &lim, &m, &info)) {
+        return;
+    }
+
+    fprintf(stderr, "engine %s: depth %d score %+d %ld nodes %d ms\n",
+            engine_level_name(ui->ai_level), info.depth, info.score,
+            info.nodes, info.millis);
+
+    apply_move(ui, m);
 }
 
 static bool try_move(Ui *ui, int from, int to, int promo)
@@ -83,6 +116,11 @@ static void handle_board_tap(Ui *ui, int sq)
     int8_t piece;
 
     if (ui->game->result != RESULT_NONE) {
+        return;
+    }
+
+    /* The board is read-only while the computer owns the move. */
+    if (ui_ai_to_move(ui)) {
         return;
     }
 
@@ -121,6 +159,15 @@ static int handle_hit(Ui *ui, UiHit hit, int sq)
         break;
     case HIT_UNDO:
         if (chess_undo(ui->game)) {
+            /*
+             * Against the computer one undo would only hand the move
+             * straight back to it, so take the reply off too.
+             */
+            chess_update_result(ui->game);
+            if (ui_ai_to_move(ui)) {
+                chess_undo(ui->game);
+            }
+
             ui->selected = SQ_NONE;
             ui->legal = 0;
             if (ui->game->hist_len > 0) {
@@ -140,6 +187,9 @@ static int handle_hit(Ui *ui, UiHit hit, int sq)
         break;
     case HIT_FLIP:
         ui->flipped = !ui->flipped;
+        break;
+    case HIT_LEVEL:
+        cycle_level(ui);
         break;
     case HIT_BOARD:
         handle_board_tap(ui, sq);
@@ -193,12 +243,25 @@ int main(void)
     ui.last_to = SQ_NONE;
     ui.pending_from = SQ_NONE;
     ui.pending_to = SQ_NONE;
+    ui.ai_level = ENGINE_OFF;
+    ui.ai_color = CHESS_BLACK;
     ui_layout(&ui);
     ui_draw(&ui, true);
 
     while (!g_quit_now) {
         InputEvent ev;
         int pr;
+
+        /*
+         * The paint from the previous pass already told the player the
+         * computer is thinking, so search here and repaint the reply.
+         */
+        if (ui_ai_to_move(&ui) && ui.mode == MODE_PLAY) {
+            play_engine_move(&ui);
+            input_drain();
+            ui_draw(&ui, false);
+            continue;
+        }
 
         pr = input_poll(&ev, 400);
         if (pr < 0) {

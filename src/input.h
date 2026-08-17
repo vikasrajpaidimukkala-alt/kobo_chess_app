@@ -20,5 +20,6 @@ typedef struct {
 int input_init(const Display *d);
 void input_close(void);
 int input_poll(InputEvent *ev, int timeout_ms);
+void input_drain(void);
 
 #endif

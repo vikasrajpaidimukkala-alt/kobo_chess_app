@@ -2,6 +2,7 @@
 *.a
 host_test
 build/host_test
+build/engine_bench
 dist/
 third_party/FBInk/Release/
 third_party/FBInk/Debug/

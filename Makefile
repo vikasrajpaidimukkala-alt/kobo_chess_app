@@ -33,10 +33,10 @@ LDLIBS   := $(FBINK_LIB) -lm -ldl
 BUILD := build
 APP   := $(BUILD)/kobochess
 
-SRCS := src/main.c src/chess.c src/display.c src/input.c src/ui.c
+SRCS := src/main.c src/chess.c src/display.c src/engine.c src/input.c src/ui.c
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
 
-.PHONY: all app tests host-test clean distclean package help fbink
+.PHONY: all app tests host-test engine-bench clean distclean package help fbink
 
 all: app tests
 
@@ -52,7 +52,7 @@ $(FBINK_LIB): $(FBINK_DIR)/fbink.h Makefile
 		KOBO=1 MINIMAL=1 DRAW=1 BITMAP=1 IMAGE=1 INPUT=1 \
 		$(FBINK_CROSS)
 
-$(BUILD)/%.o: src/%.c $(FBINK_DIR)/fbink.h src/chess.h src/display.h src/input.h src/ui.h src/hwtcon_kobo.h
+$(BUILD)/%.o: src/%.c $(FBINK_DIR)/fbink.h src/chess.h src/display.h src/engine.h src/input.h src/ui.h src/hwtcon_kobo.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
@@ -77,6 +77,14 @@ host-test:
 	cc -std=c11 -Wall -Wextra -O2 -o $(BUILD)/host_test src/chess.c src/host_test.c
 	$(BUILD)/host_test
 
+# Engine sanity checks and a nodes/second probe. Cross compile the same
+# sources to time the real device: the level budgets are tuned to it.
+engine-bench:
+	mkdir -p $(BUILD)
+	cc -std=c11 -Wall -Wextra -O2 -Isrc -o $(BUILD)/engine_bench \
+		src/chess.c src/engine.c src/engine_bench.c
+	$(BUILD)/engine_bench
+
 package: $(APP)
 	mkdir -p dist/kobochess dist/nm
 	cp -a $(APP) scripts/kobochess.sh scripts/restart-nickel.sh dist/kobochess/
@@ -87,7 +95,8 @@ package: $(APP)
 	@echo "Copy dist/nm/kobochess -> /mnt/onboard/.adds/nm/kobochess"
 
 clean:
-	rm -f $(OBJS) $(APP) $(BUILD)/fbink_test $(BUILD)/fb_direct_test $(BUILD)/host_test
+	rm -f $(OBJS) $(APP) $(BUILD)/fbink_test $(BUILD)/fb_direct_test \
+		$(BUILD)/host_test $(BUILD)/engine_bench
 	rm -rf dist
 
 distclean: clean

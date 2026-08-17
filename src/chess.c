@@ -593,22 +593,59 @@ static bool is_legal_after(Game *g, Move m)
     return ok;
 }
 
-int chess_generate_legal(const Game *g, Move *out, int max)
+/*
+ * Search variant: make/unmake leaves `g` exactly as it was, so the
+ * caller's live position can be used directly. chess_generate_legal
+ * copies the whole Game (~4 KB) per call, which a search cannot pay
+ * at every node.
+ */
+int chess_generate_legal_into(Game *g, Move *out, int max)
 {
     Move pseudo[MAX_MOVES];
     int pn;
     int n = 0;
     int i;
-    Game tmp = *g;
 
-    pn = gen_pseudo(&tmp, pseudo, MAX_MOVES);
+    pn = gen_pseudo(g, pseudo, MAX_MOVES);
     for (i = 0; i < pn && n < max; i++) {
-        if (is_legal_after(&tmp, pseudo[i])) {
+        if (is_legal_after(g, pseudo[i])) {
             out[n++] = pseudo[i];
         }
     }
 
     return n;
+}
+
+/*
+ * Captures and promotions only, filtered before the legality test so
+ * a quiescence search does not pay for a make/in-check/unmake on every
+ * quiet move it is about to discard anyway.
+ */
+int chess_generate_captures_into(Game *g, Move *out, int max)
+{
+    Move pseudo[MAX_MOVES];
+    int pn;
+    int n = 0;
+    int i;
+
+    pn = gen_pseudo(g, pseudo, MAX_MOVES);
+    for (i = 0; i < pn && n < max; i++) {
+        if (!(pseudo[i].flags & (MF_CAPTURE | MF_PROMO))) {
+            continue;
+        }
+        if (is_legal_after(g, pseudo[i])) {
+            out[n++] = pseudo[i];
+        }
+    }
+
+    return n;
+}
+
+int chess_generate_legal(const Game *g, Move *out, int max)
+{
+    Game tmp = *g;
+
+    return chess_generate_legal_into(&tmp, out, max);
 }
 
 int chess_moves_from(const Game *g, int from, Move *out, int max)

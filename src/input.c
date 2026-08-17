@@ -487,6 +487,26 @@ static void parse_buffer(const unsigned char *buf, ssize_t got, InDev *dev)
     }
 }
 
+/*
+ * Throw away whatever piled up while the engine was searching, so a
+ * tap aimed at the old position is not replayed against the new one.
+ */
+void input_drain(void)
+{
+    int i;
+
+    for (i = 0; i < g_ndevs; i++) {
+        unsigned char buf[512];
+
+        while (read(g_devs[i].fd, buf, sizeof(buf)) > 0) {
+            /* nodes are non-blocking; loop until EAGAIN */
+        }
+    }
+
+    g_armed = 1;
+    g_tap_x = -1;
+}
+
 int input_poll(InputEvent *ev, int timeout_ms)
 {
     struct pollfd pfds[MAX_FDS];

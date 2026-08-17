@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "engine.h"
+
 #define COL_BG_R  232
 #define COL_BG_G  232
 #define COL_BG_B  232
@@ -93,6 +95,7 @@ void ui_layout(Ui *ui)
     int board_w;
     int btn_y;
     int btn_w;
+    int promo_w;
     int gap = 16;
     int i;
     int dlg_w;
@@ -118,11 +121,12 @@ void ui_layout(Ui *ui)
     ui->board.y &= ~3;
 
     btn_y = (int)d->height - margin - btn_h;
-    btn_w = ((int)d->width - 2 * margin - 3 * gap) / 4;
+    btn_w = ((int)d->width - 2 * margin - 4 * gap) / 5;
     ui->btn_exit = make_rect(margin, btn_y, btn_w, btn_h);
     ui->btn_undo = make_rect(margin + btn_w + gap, btn_y, btn_w, btn_h);
     ui->btn_reset = make_rect(margin + 2 * (btn_w + gap), btn_y, btn_w, btn_h);
     ui->btn_flip = make_rect(margin + 3 * (btn_w + gap), btn_y, btn_w, btn_h);
+    ui->btn_level = make_rect(margin + 4 * (btn_w + gap), btn_y, btn_w, btn_h);
 
     dlg_w = (int)d->width * 4 / 5;
     dlg_h = 360;
@@ -136,8 +140,11 @@ void ui_layout(Ui *ui)
                             ui->dlg.y + dlg_h - 120,
                             dlg_w / 2 - 36, 88);
 
+    /* The promotion row keeps four wider buttons of its own. */
+    promo_w = ((int)d->width - 2 * margin - 3 * gap) / 4;
     for (i = 0; i < 4; i++) {
-        ui->promo[i] = make_rect(margin + i * (btn_w + gap), btn_y, btn_w, btn_h);
+        ui->promo[i] = make_rect(margin + i * (promo_w + gap), btn_y,
+                                 promo_w, btn_h);
     }
 }
 
@@ -170,8 +177,8 @@ static void draw_button(Display *d, Rect r, const char *text,
     display_fill_rect(d, r.x + r.w - 3, r.y, 3, r.h, 16, 16, 16);
 
     scale = 4;
-    if (display_text_width(text, scale) > r.w - 12) {
-        scale = 3;
+    while (scale > 1 && display_text_width(text, scale) > r.w - 12) {
+        scale--;
     }
     label_in(d, r, text, scale, tr, tg, tb);
 }
@@ -469,6 +476,13 @@ static void draw_dialog(Ui *ui, const char *title, const char *sub,
                 255, 255, 255);
 }
 
+bool ui_ai_to_move(const Ui *ui)
+{
+    return ui->ai_level != ENGINE_OFF &&
+           ui->game->result == RESULT_NONE &&
+           ui->game->side == ui->ai_color;
+}
+
 void ui_draw(Ui *ui, bool full_flash)
 {
     Display *d = ui->d;
@@ -477,7 +491,17 @@ void ui_draw(Ui *ui, bool full_flash)
 
     display_clear(d, COL_BG_R, COL_BG_G, COL_BG_B);
 
-    chess_status_text(ui->game, status, sizeof(status));
+    /*
+     * Drawn before the search runs, so the paint that shows the human's
+     * move doubles as the "please wait" screen. An e-ink refresh is far
+     * too slow to spend one on a separate thinking notice.
+     */
+    if (ui_ai_to_move(ui) && ui->mode == MODE_PLAY) {
+        snprintf(status, sizeof(status), "Computer thinking...");
+    } else {
+        chess_status_text(ui->game, status, sizeof(status));
+    }
+
     scale = 4;
     if (display_text_width(status, scale) > (int)d->width - 40) {
         scale = 3;
@@ -497,6 +521,11 @@ void ui_draw(Ui *ui, bool full_flash)
         draw_button(d, ui->btn_undo, "Undo", 48, 48, 48, 255, 255, 255);
         draw_button(d, ui->btn_reset, "Reset", 48, 48, 48, 255, 255, 255);
         draw_button(d, ui->btn_flip, "Flip", 48, 48, 48, 255, 255, 255);
+        draw_button(d, ui->btn_level, engine_level_name(ui->ai_level),
+                    (ui->ai_level == ENGINE_OFF) ? 48 : 100,
+                    (ui->ai_level == ENGINE_OFF) ? 48 : 100,
+                    (ui->ai_level == ENGINE_OFF) ? 48 : 100,
+                    255, 255, 255);
     }
 
     display_text(d, 24, ui->btn_exit.y - 28, 2, "Page turn also exits.",
@@ -579,6 +608,9 @@ UiHit ui_hit(const Ui *ui, int x, int y, int *square_out)
     }
     if (in_rect(ui->btn_flip, x, y)) {
         return HIT_FLIP;
+    }
+    if (in_rect(ui->btn_level, x, y)) {
+        return HIT_LEVEL;
     }
 
     sq = xy_to_sq(ui, x, y);

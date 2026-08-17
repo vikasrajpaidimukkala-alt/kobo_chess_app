@@ -105,6 +105,8 @@ static inline int8_t make_piece(int type, int color)
 void chess_init(Game *g);
 bool chess_in_check(const Game *g, int color);
 int chess_generate_legal(const Game *g, Move *out, int max);
+int chess_generate_legal_into(Game *g, Move *out, int max);
+int chess_generate_captures_into(Game *g, Move *out, int max);
 int chess_moves_from(const Game *g, int from, Move *out, int max);
 uint64_t chess_legal_mask(const Game *g, int from);
 bool chess_find_move(const Game *g, int from, int to, int promo, Move *out);

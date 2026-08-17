@@ -20,6 +20,7 @@ typedef enum {
     HIT_UNDO,
     HIT_RESET,
     HIT_FLIP,
+    HIT_LEVEL,
     HIT_YES,
     HIT_NO,
     HIT_PROMO_Q,
@@ -46,12 +47,15 @@ typedef struct {
     bool flipped;
     int pending_from;
     int pending_to;
+    int ai_level;   /* ENGINE_OFF, or a difficulty the computer plays at */
+    int ai_color;   /* colour the computer owns while ai_level is on */
     Rect board;
     int square;
     Rect btn_exit;
     Rect btn_undo;
     Rect btn_reset;
     Rect btn_flip;
+    Rect btn_level;
     Rect dlg;
     Rect dlg_yes;
     Rect dlg_no;
@@ -61,5 +65,8 @@ typedef struct {
 void ui_layout(Ui *ui);
 void ui_draw(Ui *ui, bool full_flash);
 UiHit ui_hit(const Ui *ui, int x, int y, int *square_out);
+
+/* True when the computer owns the side to move and the game is live. */
+bool ui_ai_to_move(const Ui *ui);
 
 #endif
