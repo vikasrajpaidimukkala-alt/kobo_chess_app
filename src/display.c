@@ -174,15 +174,14 @@ static void copy_pix_to_fb(Display *d)
 }
 
 /*
- * The four-corner test (src/fb_direct_test.c) is the only draw this
- * panel has ever rendered cleanly, and it refreshed with a zeroed
- * config: AUTO, no flash, no CFA. Default to exactly that, and allow
- * overriding from the launcher so the waveform can be bisected
- * without a rebuild.
+ * AUTO/PARTIAL (the four-corner test's config) and flashing GC16 both
+ * tore, so the waveform is not the variable. Default to flashing GC16
+ * so the white/black/white startup sequence is unmistakable, and keep
+ * the launcher override for bisecting without a rebuild.
  */
-static WFM_MODE_INDEX_T g_wfm = WFM_AUTO;
+static WFM_MODE_INDEX_T g_wfm = WFM_GC16;
 static CFA_MODE_INDEX_T g_cfa = CFA_DEFAULT;
-static bool g_flash = false;
+static bool g_flash = true;
 
 static void refresh_mode_init(void)
 {
@@ -214,22 +213,22 @@ static void refresh_mode_init(void)
             (unsigned)g_wfm, (int)g_flash, (unsigned)g_cfa);
 }
 
-static void wait_marker(Display *d, uint32_t marker, const char *tag)
+/*
+ * LAST_MARKER (0U) always resolves to the update this session just
+ * sent, so it cannot silently skip the fence the way a stale explicit
+ * marker could.
+ */
+static void wait_complete(Display *d, const char *tag)
 {
     int rc;
 
-    if (marker == LAST_MARKER) {
-        return;
-    }
-
     if (d->state.can_wait_for_submission) {
-        rc = fbink_wait_for_submission(d->fbfd, marker);
-        fprintf(stderr, "wait_for_submission %s marker=%u rc=%d\n",
-                tag, marker, rc);
+        rc = fbink_wait_for_submission(d->fbfd, LAST_MARKER);
+        fprintf(stderr, "wait_for_submission %s rc=%d\n", tag, rc);
     }
 
-    rc = fbink_wait_for_complete(d->fbfd, marker);
-    fprintf(stderr, "wait_for_complete %s marker=%u rc=%d\n", tag, marker, rc);
+    rc = fbink_wait_for_complete(d->fbfd, LAST_MARKER);
+    fprintf(stderr, "wait_for_complete %s rc=%d\n", tag, rc);
 }
 
 /*
@@ -308,13 +307,10 @@ static void verify_fb(Display *d)
 
 static int refresh_panel_wait(Display *d, const char *tag)
 {
-    static int paint = 0;
+    static int chess_paints = 0;
     FBInkConfig cfg = d->cfg;
     FBInkRect rect;
     int rc;
-
-    /* Fence the previous update before touching the mmap again. */
-    wait_marker(d, d->marker, "prev");
 
     copy_pix_to_fb(d);
 
@@ -334,18 +330,38 @@ static int refresh_panel_wait(Display *d, const char *tag)
             tag, (unsigned)g_wfm, (int)g_flash, d->width, d->height,
             rc, d->marker);
 
-    wait_marker(d, d->marker, tag);
+    wait_complete(d, tag);
 
-    if (paint == 0) {
+    if (strcmp(tag, "chess") == 0 && chess_paints == 0) {
         verify_fb(d);
         dump_pgm(DUMP_DIR "/dump_pix.pgm", d->pix, d->width, d->height,
                  d->stride);
         dump_pgm(DUMP_DIR "/dump_fb.pgm", d->fb, d->width, d->height,
                  d->fb_stride);
+        chess_paints++;
     }
-    paint++;
 
     return rc;
+}
+
+/*
+ * White, black, white, each one fenced, before the board is ever
+ * drawn. Any tear visible during this sequence is produced by three
+ * solid-colour fills, i.e. by nothing the chess code drew.
+ */
+static void startup_color_test(Display *d)
+{
+    fprintf(stderr, "sync-test WHITE\n");
+    display_clear(d, 0xFF, 0xFF, 0xFF);
+    refresh_panel_wait(d, "white1");
+
+    fprintf(stderr, "sync-test BLACK\n");
+    display_clear(d, 0x00, 0x00, 0x00);
+    refresh_panel_wait(d, "black");
+
+    fprintf(stderr, "sync-test WHITE\n");
+    display_clear(d, 0xFF, 0xFF, 0xFF);
+    refresh_panel_wait(d, "white2");
 }
 
 static void hwtcon_cmd(const char *cmd)
@@ -455,7 +471,7 @@ int display_init(Display *d)
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v14 marker-fence-dump ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v15 wbw-fence ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
         fprintf(stderr, "Screen: %u x %u, fb_stride %u, bpp %u pixfmt %u y8=%d bgra=%d, panel_color %d, mtk %d\n",
@@ -475,6 +491,8 @@ int display_init(Display *d)
             hwtcon_cmd("fiti_power 1");
         }
     }
+
+    startup_color_test(d);
 
     return 0;
 }
