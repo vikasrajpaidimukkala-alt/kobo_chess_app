@@ -15,13 +15,14 @@
 #define COL_DARK_G  140
 #define COL_DARK_B  140
 
-#define COL_SEL_R   168
-#define COL_SEL_G   168
-#define COL_SEL_B   168
-
-#define COL_LAST_R  136
-#define COL_LAST_G  136
-#define COL_LAST_B  136
+/*
+ * Highlights darken a square relative to its own shade instead of
+ * replacing it with a flat grey, so a highlighted light square stays
+ * lighter than a plain dark one and the checker pattern survives.
+ * Multiples of 17 so each tint is a whole GC16 grey level.
+ */
+#define TINT_SEL    51
+#define TINT_LAST   34
 
 #define COL_LEGAL_R 40
 #define COL_LEGAL_G 40
@@ -368,28 +369,21 @@ static void square_color(const Ui *ui, int sq,
                          uint8_t *r, uint8_t *g, uint8_t *b)
 {
     int light = ((sq_file(sq) + sq_rank(sq)) & 1) == 0;
+    int shade = light ? COL_LIGHT_R : COL_DARK_R;
 
     if (ui->selected == sq) {
-        *r = COL_SEL_R;
-        *g = COL_SEL_G;
-        *b = COL_SEL_B;
-        return;
+        shade -= TINT_SEL;
+    } else if (sq == ui->last_from || sq == ui->last_to) {
+        shade -= TINT_LAST;
     }
-    if (sq == ui->last_from || sq == ui->last_to) {
-        *r = COL_LAST_R;
-        *g = COL_LAST_G;
-        *b = COL_LAST_B;
-        return;
+
+    if (shade < 0) {
+        shade = 0;
     }
-    if (light) {
-        *r = COL_LIGHT_R;
-        *g = COL_LIGHT_G;
-        *b = COL_LIGHT_B;
-        return;
-    }
-    *r = COL_DARK_R;
-    *g = COL_DARK_G;
-    *b = COL_DARK_B;
+
+    *r = (uint8_t)shade;
+    *g = (uint8_t)shade;
+    *b = (uint8_t)shade;
 }
 
 static void draw_board(Ui *ui)
