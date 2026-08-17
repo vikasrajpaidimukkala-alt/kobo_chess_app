@@ -11,14 +11,12 @@
 
 /*
  * Packed gray offscreen, memcpy into the mmap'd RGBA framebuffer,
- * then a Kaleido refresh (GCC16 + CFA G2), fenced on the update
- * marker returned by FBInk.
+ * then one full-screen refresh fenced with wait_for_complete.
  *
- * The jagged bands through the back ranks survived GC16, GCC16, Y8,
- * a homemade ioctl, and a full submission/completion fence, so the
- * first paint of a freshly written buffer already tears. The dump
- * below exists to settle whether those bytes leave here intact, and
- * the waveform is env-selectable so it can be bisected on-device.
+ * The jagged bands that haunted the back ranks turned out to be a
+ * runaway loop in draw_bishop, not the EPDC. Set KOBOCHESS_DUMP=1 to
+ * write the offscreen buffer and a post-refresh readback as PGMs, so
+ * the next such question can be answered without a device round trip.
  *
  * Do not poke mdp_src_format. Do not send CFA_SKIP at 32bpp.
  */
@@ -27,7 +25,9 @@
 #define LAST_MARKER 0U
 #endif
 
+#ifndef DUMP_DIR
 #define DUMP_DIR "/mnt/onboard/.adds/kobochess"
+#endif
 
 static const unsigned char FONT8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* space */
@@ -174,20 +174,20 @@ static void copy_pix_to_fb(Display *d)
 }
 
 /*
- * AUTO/PARTIAL (the four-corner test's config) and flashing GC16 both
- * tore, so the waveform is not the variable. Default to flashing GC16
- * so the white/black/white startup sequence is unmistakable, and keep
- * the launcher override for bisecting without a rebuild.
+ * Flashing GC16 everywhere: a PARTIAL update leaves grey ghosts of
+ * the previous position on this Kaleido panel.
  */
 static WFM_MODE_INDEX_T g_wfm = WFM_GC16;
 static CFA_MODE_INDEX_T g_cfa = CFA_DEFAULT;
 static bool g_flash = true;
+static bool g_dump = false;
 
 static void refresh_mode_init(void)
 {
     const char *wfm = getenv("KOBOCHESS_WFM");
     const char *flash = getenv("KOBOCHESS_FLASH");
     const char *cfa = getenv("KOBOCHESS_CFA");
+    const char *dump = getenv("KOBOCHESS_DUMP");
 
     if (wfm != NULL) {
         if (strcmp(wfm, "gc16") == 0) {
@@ -209,8 +209,12 @@ static void refresh_mode_init(void)
         g_cfa = CFA_G2;
     }
 
-    fprintf(stderr, "refresh mode: wfm=%u flash=%d cfa=%u\n",
-            (unsigned)g_wfm, (int)g_flash, (unsigned)g_cfa);
+    if (dump != NULL) {
+        g_dump = (atoi(dump) != 0);
+    }
+
+    fprintf(stderr, "refresh mode: wfm=%u flash=%d cfa=%u dump=%d\n",
+            (unsigned)g_wfm, (int)g_flash, (unsigned)g_cfa, (int)g_dump);
 }
 
 /*
@@ -332,7 +336,7 @@ static int refresh_panel_wait(Display *d, const char *tag)
 
     wait_complete(d, tag);
 
-    if (strcmp(tag, "chess") == 0 && chess_paints == 0) {
+    if (g_dump && chess_paints == 0) {
         verify_fb(d);
         dump_pgm(DUMP_DIR "/dump_pix.pgm", d->pix, d->width, d->height,
                  d->stride);
@@ -342,26 +346,6 @@ static int refresh_panel_wait(Display *d, const char *tag)
     }
 
     return rc;
-}
-
-/*
- * White, black, white, each one fenced, before the board is ever
- * drawn. Any tear visible during this sequence is produced by three
- * solid-colour fills, i.e. by nothing the chess code drew.
- */
-static void startup_color_test(Display *d)
-{
-    fprintf(stderr, "sync-test WHITE\n");
-    display_clear(d, 0xFF, 0xFF, 0xFF);
-    refresh_panel_wait(d, "white1");
-
-    fprintf(stderr, "sync-test BLACK\n");
-    display_clear(d, 0x00, 0x00, 0x00);
-    refresh_panel_wait(d, "black");
-
-    fprintf(stderr, "sync-test WHITE\n");
-    display_clear(d, 0xFF, 0xFF, 0xFF);
-    refresh_panel_wait(d, "white2");
 }
 
 static void hwtcon_cmd(const char *cmd)
@@ -471,7 +455,7 @@ int display_init(Display *d)
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v15 wbw-fence ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v16 bishop-fix ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
         fprintf(stderr, "Screen: %u x %u, fb_stride %u, bpp %u pixfmt %u y8=%d bgra=%d, panel_color %d, mtk %d\n",
@@ -491,8 +475,6 @@ int display_init(Display *d)
             hwtcon_cmd("fiti_power 1");
         }
     }
-
-    startup_color_test(d);
 
     return 0;
 }

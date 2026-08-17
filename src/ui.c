@@ -251,13 +251,18 @@ static void draw_bishop(Display *d, int x, int y, int s,
 {
     int t = s / 28 + 2;
     int cx = x + s / 2;
+    int rows;
+    int span;
     int i;
 
     orect(d, cx - s / 3, y + s - s / 5, (2 * s) / 3, s / 8, t,
           fr, fg, fb, sr, sg, sb);
 
-    for (i = 0; i < s / 3; i++) {
-        int w = 4 + (i * s) / 8;
+    rows = s / 3;
+    span = (rows > 1) ? rows - 1 : 1;
+
+    for (i = 0; i < rows; i++) {
+        int w = 4 + ((s / 2 - 4) * i) / span;
 
         display_fill_rect(d, cx - w / 2 - t, y + s / 3 + i - t, w + 2 * t, 3,
                           sr, sg, sb);
