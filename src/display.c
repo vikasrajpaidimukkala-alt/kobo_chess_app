@@ -1,6 +1,5 @@
 #include "display.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
@@ -8,24 +7,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 /*
- * Packed gray offscreen, memcpy into the framebuffer, then FBInk
- * full-screen GC16. Fence each EPDC update with wait_for_submission
- * + wait_for_complete before touching the framebuffer again: writing
- * the next frame while a waveform is still in flight produces jagged
- * old/new bands on Kaleido 3.
+ * Packed gray offscreen, memcpy into the mmap'd RGBA framebuffer,
+ * then a Kaleido refresh (GCC16 + CFA G2), fenced on the update
+ * marker returned by FBInk.
  *
- * Do not send HWTCON_FLAG_CFA_SKIP at 32bpp: that makes the MTK
- * driver mix in the previous working buffer as jagged tears.
+ * The jagged bands through the back ranks survived GC16, GCC16, Y8,
+ * a homemade ioctl, and a full submission/completion fence, so the
+ * first paint of a freshly written buffer already tears. The dump
+ * below exists to settle whether those bytes leave here intact, and
+ * the waveform is env-selectable so it can be bisected on-device.
+ *
+ * Do not poke mdp_src_format. Do not send CFA_SKIP at 32bpp.
  */
 
 #ifndef LAST_MARKER
 #define LAST_MARKER 0U
 #endif
+
+#define DUMP_DIR "/mnt/onboard/.adds/kobochess"
 
 static const unsigned char FONT8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* space */
@@ -126,49 +128,8 @@ static const unsigned char FONT8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}
 };
 
-static void kobo_mtk_set_mdp_format(const char *fmt)
-{
-    DIR *dir;
-    struct dirent *ent;
-
-    dir = opendir("/sys/devices/platform");
-    if (dir == NULL) {
-        fprintf(stderr, "opendir platform: errno=%d\n", errno);
-        return;
-    }
-
-    while ((ent = readdir(dir)) != NULL) {
-        char path[256];
-        int fd;
-        size_t n;
-
-        if (strstr(ent->d_name, "hwtcon") == NULL) {
-            continue;
-        }
-
-        snprintf(path, sizeof(path),
-                 "/sys/devices/platform/%s/mdp_src_format", ent->d_name);
-        fd = open(path, O_WRONLY | O_CLOEXEC);
-        if (fd < 0) {
-            fprintf(stderr, "open %s: errno=%d\n", path, errno);
-            continue;
-        }
-
-        n = strlen(fmt);
-        if (write(fd, fmt, n) < 0) {
-            fprintf(stderr, "write %s: errno=%d\n", path, errno);
-        } else {
-            fprintf(stderr, "mdp_src_format %s <- %s\n", path, fmt);
-        }
-        close(fd);
-    }
-
-    closedir(dir);
-}
-
 static void restore_nickel_fb(int fbfd, FBInkConfig *cfg)
 {
-    kobo_mtk_set_mdp_format("ABGR32");
     if (fbfd >= 0) {
         (void)fbink_reinit(fbfd, cfg);
     }
@@ -212,44 +173,178 @@ static void copy_pix_to_fb(Display *d)
     }
 }
 
-static void wait_epdc(Display *d, const char *tag)
-{
-    int rc;
+/*
+ * The four-corner test (src/fb_direct_test.c) is the only draw this
+ * panel has ever rendered cleanly, and it refreshed with a zeroed
+ * config: AUTO, no flash, no CFA. Default to exactly that, and allow
+ * overriding from the launcher so the waveform can be bisected
+ * without a rebuild.
+ */
+static WFM_MODE_INDEX_T g_wfm = WFM_AUTO;
+static CFA_MODE_INDEX_T g_cfa = CFA_DEFAULT;
+static bool g_flash = false;
 
-    if (d->state.can_wait_for_submission) {
-        rc = fbink_wait_for_submission(d->fbfd, LAST_MARKER);
-        fprintf(stderr, "fbink_wait_for_submission %s rc=%d\n", tag, rc);
+static void refresh_mode_init(void)
+{
+    const char *wfm = getenv("KOBOCHESS_WFM");
+    const char *flash = getenv("KOBOCHESS_FLASH");
+    const char *cfa = getenv("KOBOCHESS_CFA");
+
+    if (wfm != NULL) {
+        if (strcmp(wfm, "gc16") == 0) {
+            g_wfm = WFM_GC16;
+        } else if (strcmp(wfm, "gcc16") == 0) {
+            g_wfm = WFM_GCC16;
+        } else if (strcmp(wfm, "glrc16") == 0) {
+            g_wfm = WFM_GLRC16;
+        } else if (strcmp(wfm, "gl16") == 0) {
+            g_wfm = WFM_GL16;
+        }
     }
 
-    rc = fbink_wait_for_complete(d->fbfd, LAST_MARKER);
-    fprintf(stderr, "fbink_wait_for_complete %s rc=%d\n", tag, rc);
+    if (flash != NULL) {
+        g_flash = (atoi(flash) != 0);
+    }
+
+    if (cfa != NULL && strcmp(cfa, "g2") == 0) {
+        g_cfa = CFA_G2;
+    }
+
+    fprintf(stderr, "refresh mode: wfm=%u flash=%d cfa=%u\n",
+            (unsigned)g_wfm, (int)g_flash, (unsigned)g_cfa);
 }
 
-static int refresh_gc16_wait(Display *d, const char *tag)
+static void wait_marker(Display *d, uint32_t marker, const char *tag)
 {
-    FBInkConfig cfg = d->cfg;
-    char before[64];
-    char after[64];
     int rc;
 
-    snprintf(before, sizeof(before), "before-%s", tag);
-    snprintf(after, sizeof(after), "after-%s", tag);
+    if (marker == LAST_MARKER) {
+        return;
+    }
 
-    /*
-     * The EPDC is still walking the previous waveform. Do not rewrite
-     * the mmap'd framebuffer until that update has finished.
-     */
-    wait_epdc(d, before);
+    if (d->state.can_wait_for_submission) {
+        rc = fbink_wait_for_submission(d->fbfd, marker);
+        fprintf(stderr, "wait_for_submission %s marker=%u rc=%d\n",
+                tag, marker, rc);
+    }
+
+    rc = fbink_wait_for_complete(d->fbfd, marker);
+    fprintf(stderr, "wait_for_complete %s marker=%u rc=%d\n", tag, marker, rc);
+}
+
+/*
+ * Write the red channel of a 4-byte-per-pixel buffer as a PGM, so the
+ * exact bytes the panel was handed can be inspected off-device.
+ */
+static void dump_pgm(const char *path, const unsigned char *src,
+                     unsigned int width, unsigned int height,
+                     unsigned int stride)
+{
+    FILE *f = fopen(path, "wb");
+    unsigned char *line;
+    unsigned int y;
+
+    if (f == NULL) {
+        fprintf(stderr, "dump %s: errno=%d\n", path, errno);
+        return;
+    }
+
+    line = malloc(width);
+    if (line == NULL) {
+        fclose(f);
+        return;
+    }
+
+    fprintf(f, "P5\n%u %u\n255\n", width, height);
+    for (y = 0; y < height; y++) {
+        const unsigned char *row = src + ((size_t)y * stride);
+        unsigned int x;
+
+        for (x = 0; x < width; x++) {
+            line[x] = row[(size_t)x * 4];
+        }
+        fwrite(line, 1, width, f);
+    }
+
+    free(line);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    fprintf(stderr, "dumped %s\n", path);
+}
+
+/*
+ * Does the framebuffer still hold what we wrote once the panel is
+ * done? If the driver's CFA pass writes back over our scanlines, the
+ * tears are the controller's, not ours.
+ */
+static void verify_fb(Display *d)
+{
+    unsigned int y;
+    unsigned int bad = 0;
+    int first = -1;
+    int last = -1;
+
+    if (d->fb_y8 || d->fb_bgra) {
+        return;
+    }
+
+    for (y = 0; y < d->height; y++) {
+        const unsigned char *fbrow = d->fb + ((size_t)y * d->fb_stride);
+        const unsigned char *pixrow = d->pix + ((size_t)y * d->stride);
+
+        if (memcmp(fbrow, pixrow, d->stride) != 0) {
+            bad++;
+            if (first < 0) {
+                first = (int)y;
+            }
+            last = (int)y;
+        }
+    }
+
+    fprintf(stderr, "fb readback: %u/%u rows differ (first %d last %d)\n",
+            bad, d->height, first, last);
+}
+
+static int refresh_panel_wait(Display *d, const char *tag)
+{
+    static int paint = 0;
+    FBInkConfig cfg = d->cfg;
+    FBInkRect rect;
+    int rc;
+
+    /* Fence the previous update before touching the mmap again. */
+    wait_marker(d, d->marker, "prev");
 
     copy_pix_to_fb(d);
 
-    cfg.wfm_mode = WFM_GC16;
-    cfg.is_flashing = true;
+    cfg.wfm_mode = g_wfm;
+    cfg.is_flashing = g_flash;
     cfg.dithering_mode = HWD_PASSTHROUGH;
-    rc = fbink_refresh(d->fbfd, 0, 0, 0, 0, &cfg);
-    fprintf(stderr, "fbink_refresh %s gc16 flash=1 rc=%d\n", tag, rc);
+    cfg.cfa_mode = g_cfa;
 
-    wait_epdc(d, after);
+    rect.left = 0;
+    rect.top = 0;
+    rect.width = (unsigned short)d->width;
+    rect.height = (unsigned short)d->height;
+    rc = fbink_refresh_rect(d->fbfd, &rect, &cfg);
+
+    d->marker = fbink_get_last_marker();
+    fprintf(stderr, "refresh %s wfm=%u flash=%d %ux%u rc=%d marker=%u\n",
+            tag, (unsigned)g_wfm, (int)g_flash, d->width, d->height,
+            rc, d->marker);
+
+    wait_marker(d, d->marker, tag);
+
+    if (paint == 0) {
+        verify_fb(d);
+        dump_pgm(DUMP_DIR "/dump_pix.pgm", d->pix, d->width, d->height,
+                 d->stride);
+        dump_pgm(DUMP_DIR "/dump_fb.pgm", d->fb, d->width, d->height,
+                 d->fb_stride);
+    }
+    paint++;
+
     return rc;
 }
 
@@ -281,11 +376,7 @@ int display_init(Display *d)
     d->cfg.ignore_alpha = true;
     d->cfg.bg_color = BG_WHITE;
 
-    /*
-     * Libra Colour's fb is already portrait. FBInk image/coord rotation
-     * would shear an already-upright buffer.
-     */
-    (void)setenv("FBINK_NO_SW_ROTA", "1", 1);
+    refresh_mode_init();
 
     d->fbfd = fbink_open();
     if (d->fbfd < 0) {
@@ -299,12 +390,6 @@ int display_init(Display *d)
         fbink_close(d->fbfd);
         d->fbfd = -1;
         return -1;
-    }
-
-    kobo_mtk_set_mdp_format("ABGR32");
-    rc = fbink_reinit(d->fbfd, &d->cfg);
-    if (rc < 0) {
-        fprintf(stderr, "fbink_reinit() after mdp_src_format: %d\n", rc);
     }
 
     fbink_get_state(&d->cfg, &d->state);
@@ -370,7 +455,7 @@ int display_init(Display *d)
         memset(&vinfo, 0, sizeof(vinfo));
         memset(&finfo, 0, sizeof(finfo));
         fbink_get_fb_info(&vinfo, &finfo);
-        fprintf(stderr, "======== KOBOCHESS_DRAW v12 wait-fence ========\n");
+        fprintf(stderr, "======== KOBOCHESS_DRAW v14 marker-fence-dump ========\n");
         fprintf(stderr, "Device: %s (%s)\n",
                 d->state.device_name, d->state.device_codename);
         fprintf(stderr, "Screen: %u x %u, fb_stride %u, bpp %u pixfmt %u y8=%d bgra=%d, panel_color %d, mtk %d\n",
@@ -389,23 +474,6 @@ int display_init(Display *d)
             hwtcon_cmd("night_mode 0");
             hwtcon_cmd("fiti_power 1");
         }
-
-        /*
-         * Diagnostic: white / black / white, each fenced, then the
-         * chessboard paint in main. If the board is clean after this,
-         * the jagged bands were refresh overlap, not drawing.
-         */
-        fprintf(stderr, "sync-test WHITE\n");
-        display_clear(d, 0xFF, 0xFF, 0xFF);
-        refresh_gc16_wait(d, "white1");
-
-        fprintf(stderr, "sync-test BLACK\n");
-        display_clear(d, 0x00, 0x00, 0x00);
-        refresh_gc16_wait(d, "black");
-
-        fprintf(stderr, "sync-test WHITE\n");
-        display_clear(d, 0xFF, 0xFF, 0xFF);
-        refresh_gc16_wait(d, "white2");
     }
 
     return 0;
@@ -607,11 +675,11 @@ void display_refresh(Display *d, int x, int y, int w, int h,
     (void)wfm;
     (void)flash;
 
-    refresh_gc16_wait(d, "chess");
+    refresh_panel_wait(d, "chess");
 }
 
 void display_refresh_full(Display *d, bool flash)
 {
     (void)flash;
-    refresh_gc16_wait(d, "chess");
+    refresh_panel_wait(d, "chess");
 }

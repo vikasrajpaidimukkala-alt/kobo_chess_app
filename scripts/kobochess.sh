@@ -84,6 +84,13 @@ if [ "${VIA_NICKEL}" = "1" ]; then
     usleep 1000000 2>/dev/null || sleep 1
 fi
 
+# Waveform bisect without a rebuild: KOBOCHESS_WFM / _FLASH / _CFA.
+if [ -r "${APPDIR}/refresh.env" ]; then
+    . "${APPDIR}/refresh.env"
+    export KOBOCHESS_WFM KOBOCHESS_FLASH KOBOCHESS_CFA
+    log "refresh.env wfm=${KOBOCHESS_WFM} flash=${KOBOCHESS_FLASH} cfa=${KOBOCHESS_CFA}"
+fi
+
 log "Starting kobochess $(ls -l "${APPDIR}/kobochess" 2>/dev/null | awk '{print $5, $6, $7, $8}')"
 "${APPDIR}/kobochess" >>"${LOG}" 2>&1
 rc=$?
